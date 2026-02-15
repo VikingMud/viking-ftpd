@@ -228,7 +228,7 @@ func TestLineParsing(t *testing.T) {
 					tt.setup(t)
 				}
 				lp := NewLineParser(tt.line)
-				key, val, err := lp.ParseLine()
+				key, val, err := lp.ParseLine(nil)
 				if (err != nil) != tt.wantErr {
 					t.Errorf("ParseLine() error = %v, wantErr %v", err, tt.wantErr)
 					return
@@ -469,7 +469,7 @@ func TestValueParsing(t *testing.T) {
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
 				lp := NewLineParser(tt.input)
-				got, err := lp.parseValue()
+				got, err := lp.parseValue(nil)
 				if (err != nil) != tt.wantErr {
 					t.Errorf("parseValue() error = %v, wantErr %v", err, tt.wantErr)
 					return
@@ -556,7 +556,7 @@ func TestValueParsing(t *testing.T) {
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
 				lp := NewLineParser(tt.input)
-				got, err := lp.parseArray()
+				got, err := lp.parseArray(nil)
 				if (err != nil) != tt.wantErr {
 					t.Errorf("parseArray() error = %v, wantErr %v", err, tt.wantErr)
 					return
@@ -645,7 +645,7 @@ func TestValueParsing(t *testing.T) {
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
 				lp := NewLineParser(tt.input)
-				got, err := lp.parseMap()
+				got, err := lp.parseMap(nil)
 				if (err != nil) != tt.wantErr {
 					t.Errorf("parseMap() error = %v, wantErr %v", err, tt.wantErr)
 					return
@@ -699,7 +699,7 @@ func TestValueParsing(t *testing.T) {
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
 				p := NewLineParser(tt.input)
-				got, err := p.parseValue()
+				got, err := p.parseValue(nil)
 				if (err != nil) != tt.wantErr {
 					t.Errorf("parseValue() error = %v, wantErr %v", err, tt.wantErr)
 					return
@@ -708,6 +708,130 @@ func TestValueParsing(t *testing.T) {
 					t.Errorf("parseValue() = %v, want %v", got, tt.want)
 				}
 			})
+		}
+	})
+}
+
+// Reference Parsing Tests
+func TestReferenceParsing(t *testing.T) {
+	t.Run("Array References", func(t *testing.T) {
+		tests := []struct {
+			name    string
+			input   string
+			want    interface{}
+			wantErr bool
+		}{
+			{
+				name:  "Simple Array Reference",
+				input: "refs ({1|1})\nref #0",
+				want: map[string]interface{}{
+					"refs": []interface{}{1},
+					"ref":  []interface{}{1},
+				},
+			},
+			{
+				name:  "Multiple Arrays with Reference",
+				input: "first ({2|1,2})\nsecond ({1|3})\nref #0",
+				want: map[string]interface{}{
+					"first":  []interface{}{1, 2},
+					"second": []interface{}{3},
+					"ref":    []interface{}{1, 2},
+				},
+			},
+			{
+				name:    "Invalid Array Reference Index",
+				input:   "test #5",
+				wantErr: true,
+			},
+			{
+				name:    "Negative Array Reference Index",
+				input:   "test #-1",
+				wantErr: true,
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				p := NewObjectParser(true)
+				got, err := p.ParseObject(tt.input)
+				if (err != nil) != tt.wantErr {
+					t.Errorf("ParseObject() error = %v, wantErr %v", err, tt.wantErr)
+					return
+				}
+				if !tt.wantErr && !reflect.DeepEqual(got.Object, tt.want) {
+					t.Errorf("ParseObject() = %v, want %v", got.Object, tt.want)
+				}
+			})
+		}
+	})
+
+	t.Run("Mapping References", func(t *testing.T) {
+		tests := []struct {
+			name    string
+			input   string
+			want    interface{}
+			wantErr bool
+		}{
+			{
+				name:  "Simple Mapping Reference",
+				input: "data ([1|\"key\":\"value\"])\nref @0",
+				want: map[string]interface{}{
+					"data": map[string]interface{}{"key": "value"},
+					"ref":  map[string]interface{}{"key": "value"},
+				},
+			},
+			{
+				name:  "Multiple Mappings with Reference",
+				input: "first ([1|\"a\":1])\nsecond ([1|\"b\":2])\nref @1",
+				want: map[string]interface{}{
+					"first":  map[string]interface{}{"a": 1},
+					"second": map[string]interface{}{"b": 2},
+					"ref":    map[string]interface{}{"b": 2},
+				},
+			},
+			{
+				name:    "Invalid Mapping Reference Index",
+				input:   "test @10",
+				wantErr: true,
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				p := NewObjectParser(true)
+				got, err := p.ParseObject(tt.input)
+				if (err != nil) != tt.wantErr {
+					t.Errorf("ParseObject() error = %v, wantErr %v", err, tt.wantErr)
+					return
+				}
+				if !tt.wantErr && !reflect.DeepEqual(got.Object, tt.want) {
+					t.Errorf("ParseObject() = %v, want %v", got.Object, tt.want)
+				}
+			})
+		}
+	})
+
+	t.Run("Mixed Array and Mapping References", func(t *testing.T) {
+		input := `array ({2|1,2})
+mapping ([1|"key":"val"])
+array_ref #0
+mapping_ref @0`
+
+		want := map[string]interface{}{
+			"array":       []interface{}{1, 2},
+			"mapping":     map[string]interface{}{"key": "val"},
+			"array_ref":   []interface{}{1, 2},
+			"mapping_ref": map[string]interface{}{"key": "val"},
+		}
+
+		p := NewObjectParser(true)
+		got, err := p.ParseObject(input)
+		if err != nil {
+			t.Errorf("ParseObject() error = %v", err)
+			return
+		}
+		if !reflect.DeepEqual(got.Object, want) {
+			t.Errorf("ParseObject() = %v, want %v", got.Object, want)
 		}
 	})
 }

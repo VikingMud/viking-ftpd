@@ -8,6 +8,16 @@ import (
 	"unicode/utf8"
 )
 
+// ParsingContext holds all shared state during LPC object parsing.
+// This includes reference tracking and error context information.
+type ParsingContext struct {
+	arrayRefs []interface{} // parsed arrays for reference resolution
+	mapRefs   []interface{} // parsed mappings for reference resolution
+	filename  string        // filename for error messages (optional)
+	lineNum   int           // current line number for error messages
+	strict    bool          // strict parsing mode
+}
+
 // ObjectParser holds parsing configuration for LPC object format.
 // The format is used to store and restore object state in DGD.
 type ObjectParser struct {
@@ -63,6 +73,7 @@ func NewLineParser(line string) *LineParser {
 	}
 }
 
+
 // ParseObject parses an LPC object from the input string.
 // The input should consist of key-value pairs, one per line.
 // Empty lines and lines starting with # are ignored.
@@ -77,6 +88,13 @@ func (p *ObjectParser) ParseObject(input string) (*ParseResult, error) {
 		Errors: make([]*ParseError, 0),
 	}
 
+	// Create parsing context to track references and state
+	ctx := &ParsingContext{
+		arrayRefs: make([]interface{}, 0),
+		mapRefs:   make([]interface{}, 0),
+		strict:    p.strict,
+	}
+
 	lines := strings.Split(input, "\n")
 	startPos := 0
 
@@ -87,9 +105,12 @@ func (p *ObjectParser) ParseObject(input string) (*ParseResult, error) {
 			continue
 		}
 
+		// Update context with current line info
+		ctx.lineNum = lineNum + 1
+
 		// Parse key and value
 		lp := NewLineParser(line)
-		key, value, err := lp.ParseLine()
+		key, value, err := lp.ParseLine(ctx)
 		if err != nil {
 			parseErr := &ParseError{
 				Line:     lineNum + 1,
@@ -123,7 +144,8 @@ func (p *ObjectParser) ParseObject(input string) (*ParseResult, error) {
 // - Exactly one space between key and value
 // - No tabs allowed
 // - Line must end with newline or EOF
-func (p *LineParser) ParseLine() (string, interface{}, error) {
+// The ctx parameter can be nil for simple parsing, or provided to enable reference resolution.
+func (p *LineParser) ParseLine(ctx *ParsingContext) (string, interface{}, error) {
 	// Skip comment lines
 	if p.peek(0) == '#' {
 		return "", nil, nil
@@ -154,7 +176,7 @@ func (p *LineParser) ParseLine() (string, interface{}, error) {
 		return "", nil, fmt.Errorf("multiple spaces or tabs not allowed at position %d", p.pos)
 	}
 
-	value, err := p.parseValue()
+	value, err := p.parseValue(ctx)
 	if err != nil {
 		return "", nil, err
 	}
@@ -179,7 +201,9 @@ func (p *LineParser) ParseLine() (string, interface{}, error) {
 // - Arrays
 // - Maps
 // - nil
-func (p *LineParser) parseValue() (interface{}, error) {
+// - Array references (#n)
+// - Mapping references (@n)
+func (p *LineParser) parseValue(ctx *ParsingContext) (interface{}, error) {
 	p.skipSpaces()
 
 	r := p.peek(0)
@@ -190,9 +214,17 @@ func (p *LineParser) parseValue() (interface{}, error) {
 	} else if r == '(' {
 		// Could be array or map
 		if p.peek(1) == '{' {
-			return p.parseArray()
+			array, err := p.parseArray(ctx)
+			if err == nil && ctx != nil {
+				ctx.arrayRefs = append(ctx.arrayRefs, array)
+			}
+			return array, err
 		} else if p.peek(1) == '[' {
-			return p.parseMap()
+			mapping, err := p.parseMap(ctx)
+			if err == nil && ctx != nil {
+				ctx.mapRefs = append(ctx.mapRefs, mapping)
+			}
+			return mapping, err
 		}
 		return nil, fmt.Errorf("invalid value starting with '(' at position %d", p.pos)
 	} else if r == 'n' {
@@ -203,13 +235,66 @@ func (p *LineParser) parseValue() (interface{}, error) {
 		}
 		p.pos = pos
 		return nil, fmt.Errorf("invalid nil value at position %d", p.pos)
+	} else if r == '#' {
+		// Array reference
+		return p.parseArrayReference(ctx)
+	} else if r == '@' {
+		// Mapping reference
+		return p.parseMappingReference(ctx)
 	}
 
 	return nil, fmt.Errorf("invalid value starting with '%c' at position %d", r, p.pos)
 }
 
+
 func (p *LineParser) isValidTerminator(r rune) bool {
 	return r == ',' || r == ':' || r == ']' || r == '}' || r == ')' || r == '\n' || r == 0
+}
+
+// parseArrayReference parses an array reference (#n).
+// Returns the referenced array from the shared arrayRefs list.
+func (p *LineParser) parseArrayReference(ctx *ParsingContext) (interface{}, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("array references not supported without parsing context")
+	}
+
+	if !p.expect('#') {
+		return nil, fmt.Errorf("expected '#' at position %d", p.pos)
+	}
+
+	index, err := p.parseInt()
+	if err != nil {
+		return nil, fmt.Errorf("invalid array reference index: %v", err)
+	}
+
+	if index < 0 || index >= len(ctx.arrayRefs) {
+		return nil, fmt.Errorf("array reference #%d out of bounds (have %d arrays)", index, len(ctx.arrayRefs))
+	}
+
+	return ctx.arrayRefs[index], nil
+}
+
+// parseMappingReference parses a mapping reference (@n).
+// Returns the referenced mapping from the shared mapRefs list.
+func (p *LineParser) parseMappingReference(ctx *ParsingContext) (interface{}, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("mapping references not supported without parsing context")
+	}
+
+	if !p.expect('@') {
+		return nil, fmt.Errorf("expected '@' at position %d", p.pos)
+	}
+
+	index, err := p.parseInt()
+	if err != nil {
+		return nil, fmt.Errorf("invalid mapping reference index: %v", err)
+	}
+
+	if index < 0 || index >= len(ctx.mapRefs) {
+		return nil, fmt.Errorf("mapping reference @%d out of bounds (have %d mappings)", index, len(ctx.mapRefs))
+	}
+
+	return ctx.mapRefs[index], nil
 }
 
 // parseArray parses an array value.
@@ -217,7 +302,7 @@ func (p *LineParser) isValidTerminator(r rune) bool {
 // - Size must match the number of elements
 // - Elements are comma-separated with no trailing comma
 // - Arrays can be nested
-func (p *LineParser) parseArray() ([]interface{}, error) {
+func (p *LineParser) parseArray(ctx *ParsingContext) ([]interface{}, error) {
 	if !p.match("({") {
 		return nil, fmt.Errorf("error in array: expected '({' at position %d", p.pos)
 	}
@@ -255,7 +340,7 @@ func (p *LineParser) parseArray() ([]interface{}, error) {
 	// Parse elements
 	for {
 		// Parse element
-		element, err := p.parseValue()
+		element, err := p.parseValue(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("error in array: %v", err)
 		}
@@ -289,6 +374,7 @@ func (p *LineParser) parseArray() ([]interface{}, error) {
 	return elements, nil
 }
 
+
 // parseMap parses a mapping value.
 // Format: ([size|key1:val1,key2:val2,...])
 // - Size must match the number of entries
@@ -296,7 +382,7 @@ func (p *LineParser) parseArray() ([]interface{}, error) {
 // - Keys can be any valid value type
 // - Values can be any valid value type
 // - Mappings can be nested
-func (p *LineParser) parseMap() (map[string]interface{}, error) {
+func (p *LineParser) parseMap(ctx *ParsingContext) (map[string]interface{}, error) {
 	if !p.match("([") {
 		return nil, fmt.Errorf("error in map: expected '([' at position %d", p.pos)
 	}
@@ -328,7 +414,7 @@ func (p *LineParser) parseMap() (map[string]interface{}, error) {
 
 	for {
 		// Parse key:value pair
-		key, value, skipped, err := p.parseMapEntry()
+		key, value, skipped, err := p.parseMapEntry(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -398,11 +484,11 @@ func isHexDigit(r rune) bool {
 // - Floats
 // - nil
 // Values can be any valid value type.
-func (p *LineParser) parseMapEntry() (string, interface{}, bool, error) {
+func (p *LineParser) parseMapEntry(ctx *ParsingContext) (string, interface{}, bool, error) {
 	p.skipSpaces()
 
 	// Parse key - can be any valid value type
-	keyValue, err := p.parseValue()
+	keyValue, err := p.parseValue(ctx)
 	if err != nil {
 		return "", nil, false, fmt.Errorf("error in map entry: invalid key at position %d: %v", p.pos, err)
 	}
@@ -422,7 +508,7 @@ func (p *LineParser) parseMapEntry() (string, interface{}, bool, error) {
 		if p.peek(0) == ':' {
 			p.next() // skip :
 			// Parse and discard the value
-			if _, err := p.parseValue(); err != nil {
+			if _, err := p.parseValue(ctx); err != nil {
 				return "", nil, false, err
 			}
 		}
@@ -439,7 +525,7 @@ func (p *LineParser) parseMapEntry() (string, interface{}, bool, error) {
 	}
 
 	// Parse value
-	value, err := p.parseValue()
+	value, err := p.parseValue(ctx)
 	if err != nil {
 		return "", nil, false, err
 	}
