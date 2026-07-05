@@ -8,11 +8,11 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"sync/atomic"
 	"time"
 
 	ftpserverlib "github.com/fclairamb/ftpserverlib"
 	"github.com/mmcdole/viking-ftpd/pkg/logging"
+	"github.com/mmcdole/viking-ftpd/pkg/status"
 	"github.com/mmcdole/viking-ftpd/pkg/users"
 	"github.com/mmcdole/viking-ftpd/pkg/vfs"
 	"github.com/spf13/afero"
@@ -26,29 +26,32 @@ type Authenticator interface {
 
 // Config holds the server configuration
 type Config struct {
-	ListenAddr     string // Address to listen on
-	Port           int    // Port to listen on
-	RootDir        string // Root directory that FTP users will be restricted to
-	HomePattern    string // Pattern for user home directories (e.g., "/home/%s")
-	TLSCertFile    string // Path to TLS certificate file
-	TLSKeyFile     string // Path to TLS private key file
-	PasvPortRange  [2]int // Range of ports for passive mode transfers
-	PasvAddress    string // Public IP for passive mode connections
-	PasvIPVerify   bool   // Whether to verify data connection IPs
-	IdleTimeout    int    // Connection idle timeout in seconds (0 = library default)
-	MaxConnections int    // Maximum concurrent connections (0 = unlimited)
+	ListenAddr     string        // Address to listen on
+	Port           int           // Port to listen on
+	RootDir        string        // Root directory that FTP users will be restricted to
+	HomePattern    string        // Pattern for user home directories (e.g., "/home/%s")
+	TLSCertFile    string        // Path to TLS certificate file
+	TLSKeyFile     string        // Path to TLS private key file
+	PasvPortRange  [2]int        // Range of ports for passive mode transfers
+	PasvAddress    string        // Public IP for passive mode connections
+	PasvIPVerify   bool          // Whether to verify data connection IPs
+	IdleTimeout    time.Duration // Connection idle timeout (0 = library default)
+	MaxConnections int           // Maximum concurrent connections (0 = unlimited)
+
+	// Listener, if set, is used instead of binding ListenAddr:Port. Useful for
+	// socket activation and tests that need an already-bound ephemeral port.
+	Listener net.Listener
 }
 
 // Server wraps the FTP server with our custom auth
 type Server struct {
-	config            *Config
-	authenticator     Authenticator
-	authorizer        vfs.Authorizer
-	server            *ftpserverlib.FtpServer
-	version           string
-	activeConnections atomic.Int32
-	totalConnections  atomic.Int64
-	startTime         time.Time
+	config        *Config
+	authenticator Authenticator
+	authorizer    vfs.Authorizer
+	server        *ftpserverlib.FtpServer
+	version       string
+
+	status.ConnMetrics
 }
 
 // New creates a new FTP server
@@ -63,8 +66,8 @@ func New(config *Config, authorizer vfs.Authorizer, authenticator Authenticator,
 		authorizer:    authorizer,
 		authenticator: authenticator,
 		version:       version,
-		startTime:     time.Now(),
 	}
+	s.SetStartTime(time.Now())
 
 	driver := &ftpDriver{server: s}
 	s.server = ftpserverlib.NewFtpServer(driver)
@@ -85,20 +88,8 @@ func (s *Server) Stop() error {
 	return s.server.Stop()
 }
 
-// GetActiveConnections returns the current number of active connections
-func (s *Server) GetActiveConnections() int32 {
-	return s.activeConnections.Load()
-}
-
-// GetTotalConnections returns the total number of connections since server start
-func (s *Server) GetTotalConnections() int64 {
-	return s.totalConnections.Load()
-}
-
-// GetStartTime returns the server start time
-func (s *Server) GetStartTime() time.Time {
-	return s.startTime
-}
+// Connection metrics (GetActiveConnections, GetTotalConnections,
+// GetStartTime) are promoted from the embedded status.ConnMetrics.
 
 // ftpDriver implements ftpserverlib.MainDriver
 type ftpDriver struct {
@@ -118,7 +109,9 @@ func (d *ftpDriver) GetSettings() (*ftpserverlib.Settings, error) {
 		},
 		TLSRequired:       ftpserverlib.ClearOrEncrypted,
 		DisableActiveMode: true,
-		IdleTimeout:       d.server.config.IdleTimeout,
+		// ftpserverlib expects whole seconds.
+		IdleTimeout: int(d.server.config.IdleTimeout / time.Second),
+		Listener:    d.server.config.Listener,
 	}
 
 	if d.server.config.PasvAddress != "" {
@@ -140,14 +133,14 @@ func (d *ftpDriver) ClientConnected(cc ftpserverlib.ClientContext) (string, erro
 	// Increment active connection counter. On refusal we leave it incremented:
 	// ftpserverlib still calls ClientDisconnected (via a deferred end()) even
 	// when ClientConnected returns an error, so the decrement there balances it.
-	active := d.server.activeConnections.Add(1)
+	active := d.server.IncActive()
 	if max := d.server.config.MaxConnections; max > 0 && active > int32(max) {
 		logging.Access.LogAccess("connect", "", cc.RemoteAddr().String(), "denied", "error", "connection limit reached")
 		return "Too many connections, please try again later", fmt.Errorf("connection limit reached")
 	}
 
 	// Only count accepted connections toward the lifetime total.
-	d.server.totalConnections.Add(1)
+	d.server.IncTotal()
 
 	// Enable debug logging if log level is debug
 	if logging.App.IsDebug() {
@@ -161,7 +154,7 @@ func (d *ftpDriver) ClientConnected(cc ftpserverlib.ClientContext) (string, erro
 // Interface: ftpserverlib.MainDriver
 func (d *ftpDriver) ClientDisconnected(cc ftpserverlib.ClientContext) {
 	// Decrement active connection counter
-	d.server.activeConnections.Add(-1)
+	d.server.DecActive()
 
 	logging.Access.LogAccess("disconnect", "", cc.RemoteAddr().String(), "success")
 }

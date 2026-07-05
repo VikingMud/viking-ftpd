@@ -15,6 +15,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/mmcdole/viking-ftpd/pkg/logging"
+	"github.com/mmcdole/viking-ftpd/pkg/status"
 	"github.com/mmcdole/viking-ftpd/pkg/users"
 	"github.com/mmcdole/viking-ftpd/pkg/vfs"
 )
@@ -56,9 +57,7 @@ type Server struct {
 	stopping bool
 	wg       sync.WaitGroup
 
-	activeConnections atomic.Int32
-	totalConnections  atomic.Int64
-	startTime         time.Time
+	status.ConnMetrics
 }
 
 // New creates a new SFTP server. The host key is loaded (or generated)
@@ -83,8 +82,8 @@ func New(config *Config, authorizer vfs.Authorizer, authenticator Authenticator,
 		authorizer:    authorizer,
 		version:       version,
 		conns:         make(map[net.Conn]struct{}),
-		startTime:     time.Now(),
 	}
+	s.SetStartTime(time.Now())
 
 	// Only password auth is offered; with no PublicKeyCallback the publickey
 	// method is never advertised to clients.
@@ -217,20 +216,8 @@ func (s *Server) Addr() net.Addr {
 	return s.listener.Addr()
 }
 
-// GetActiveConnections returns the current number of active connections
-func (s *Server) GetActiveConnections() int32 {
-	return s.activeConnections.Load()
-}
-
-// GetTotalConnections returns the total number of connections since server start
-func (s *Server) GetTotalConnections() int64 {
-	return s.totalConnections.Load()
-}
-
-// GetStartTime returns the server start time
-func (s *Server) GetStartTime() time.Time {
-	return s.startTime
-}
+// Connection metrics (GetActiveConnections, GetTotalConnections,
+// GetStartTime) are promoted from the embedded status.ConnMetrics.
 
 // untrackConn removes conn from the tracked set and closes it.
 func (s *Server) untrackConn(conn net.Conn) {
@@ -247,14 +234,14 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	// Atomic increment-then-check so concurrent dials can't both slip past a
 	// load-then-add limit check.
-	n := s.activeConnections.Add(1)
-	defer s.activeConnections.Add(-1)
+	n := s.IncActive()
+	defer s.DecActive()
 	if s.config.MaxConnections > 0 && n > int32(s.config.MaxConnections) {
 		logging.App.Warn("Refusing SFTP connection: connection limit reached", "client_ip", remoteAddr, "max_connections", s.config.MaxConnections)
 		return
 	}
 
-	s.totalConnections.Add(1)
+	s.IncTotal()
 	logging.Access.LogAccess("connect", "", remoteAddr, "success", "protocol", "sftp")
 	defer logging.Access.LogAccess("disconnect", "", remoteAddr, "success", "protocol", "sftp")
 

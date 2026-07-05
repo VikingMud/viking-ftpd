@@ -7,6 +7,7 @@ require (
 	github.com/fclairamb/ftpserverlib v0.25.0
 	github.com/fclairamb/go-log v0.5.0
 	github.com/pkg/sftp v1.13.9
+	github.com/secsy/goftp v0.0.0-20200609142545-aa2de14babf4
 	github.com/spf13/afero v1.11.0
 	github.com/spf13/cobra v1.8.1
 	github.com/stretchr/testify v1.10.0

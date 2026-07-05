@@ -1,6 +1,7 @@
 package ftpserver
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -16,14 +17,22 @@ import (
 )
 
 // fakeContext is a minimal ftpserverlib.ClientContext for driver tests. Only
-// Path() is exercised; any other method call would panic on the nil embedded
-// interface, which flags accidental reliance on unimplemented behavior.
+// the methods the driver actually calls are implemented; any other call would
+// panic on the nil embedded interface, flagging accidental reliance on
+// unimplemented behavior.
 type fakeContext struct {
 	ftpserverlib.ClientContext
-	path string
+	path      string
+	debug     bool
+	setPathTo string
 }
 
-func (f *fakeContext) Path() string { return f.path }
+func (f *fakeContext) Path() string     { return f.path }
+func (f *fakeContext) SetPath(p string) { f.setPathTo = p }
+func (f *fakeContext) SetDebug(d bool)  { f.debug = d }
+func (f *fakeContext) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+}
 
 type stubAccessSource struct {
 	tree map[string]interface{}
