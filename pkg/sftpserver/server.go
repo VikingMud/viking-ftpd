@@ -1,0 +1,364 @@
+package sftpserver
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/pkg/sftp"
+	"github.com/spf13/afero"
+	"golang.org/x/crypto/ssh"
+
+	"github.com/mmcdole/viking-ftpd/pkg/logging"
+	"github.com/mmcdole/viking-ftpd/pkg/users"
+)
+
+// handshakeTimeout bounds how long a client may take to complete the SSH
+// handshake and authentication, so half-open pre-auth connections can't
+// accumulate.
+const handshakeTimeout = 30 * time.Second
+
+// Authenticator verifies user credentials. Satisfied by
+// *authentication.Authenticator.
+type Authenticator interface {
+	Authenticate(username, password string) (*users.User, error)
+}
+
+// Authorizer answers per-path permission checks. Satisfied by
+// *authorization.Authorizer.
+type Authorizer interface {
+	CanRead(username, path string) bool
+	CanWrite(username, path string) bool
+}
+
+// Config holds the server configuration
+type Config struct {
+	ListenAddr     string        // Address to listen on
+	Port           int           // Port to listen on
+	RootDir        string        // Root directory that SFTP users will be restricted to
+	HomePattern    string        // Pattern for user home directories (e.g., "players/%s")
+	HostKeyFile    string        // Path to the SSH host key (generated if missing)
+	IdleTimeout    time.Duration // Connection idle timeout (0 = none)
+	MaxConnections int           // Maximum concurrent connections (0 = unlimited)
+}
+
+// Server is an SFTP server that enforces the same authentication,
+// authorization, and filesystem jail as the FTP server.
+type Server struct {
+	config        *Config
+	authenticator Authenticator
+	authorizer    Authorizer
+	sshConfig     *ssh.ServerConfig
+	version       string
+
+	mu       sync.Mutex
+	listener net.Listener
+	conns    map[*ssh.ServerConn]struct{}
+	stopping bool
+	wg       sync.WaitGroup
+
+	activeConnections atomic.Int32
+	totalConnections  atomic.Int64
+	startTime         time.Time
+}
+
+// New creates a new SFTP server. The host key is loaded (or generated)
+// eagerly so that a bad key configuration fails at startup rather than on
+// first connection.
+func New(config *Config, authorizer Authorizer, authenticator Authenticator, version string) (*Server, error) {
+	if _, err := os.Stat(config.RootDir); err != nil {
+		return nil, fmt.Errorf("root directory does not exist: %w", err)
+	}
+	if config.HostKeyFile == "" {
+		return nil, fmt.Errorf("host key file path is required")
+	}
+
+	signer, err := loadOrGenerateHostKey(config.HostKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("loading host key: %w", err)
+	}
+
+	s := &Server{
+		config:        config,
+		authenticator: authenticator,
+		authorizer:    authorizer,
+		version:       version,
+		conns:         make(map[*ssh.ServerConn]struct{}),
+		startTime:     time.Now(),
+	}
+
+	// Only password auth is offered; with no PublicKeyCallback the publickey
+	// method is never advertised to clients.
+	sshConfig := &ssh.ServerConfig{
+		MaxAuthTries:     6,
+		ServerVersion:    "SSH-2.0-VikingSFTP",
+		PasswordCallback: s.passwordCallback,
+		AuthLogCallback: func(conn ssh.ConnMetadata, method string, err error) {
+			logging.App.Debug("SSH auth attempt", "user", conn.User(), "method", method, "success", err == nil)
+		},
+	}
+	sshConfig.AddHostKey(signer)
+	s.sshConfig = sshConfig
+
+	return s, nil
+}
+
+// passwordCallback authenticates SSH password attempts. Timing-attack and
+// user-enumeration protection lives inside Authenticate; the returned error
+// is generic so nothing extra leaks to the client.
+func (s *Server) passwordCallback(conn ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+	_, err := s.authenticator.Authenticate(conn.User(), string(pass))
+	if err != nil {
+		logging.Access.LogAuth("login", conn.User(), "failed", "error", err, "client_ip", conn.RemoteAddr().String(), "protocol", "sftp")
+		return nil, fmt.Errorf("authentication failed")
+	}
+
+	logging.Access.LogAuth("login", conn.User(), "success", "client_ip", conn.RemoteAddr().String(), "protocol", "sftp")
+	return nil, nil
+}
+
+// ListenAndServe starts the server and blocks until Stop is called or the
+// listener fails.
+func (s *Server) ListenAndServe() error {
+	addr := fmt.Sprintf("%s:%d", s.config.ListenAddr, s.config.Port)
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listening on %s: %w", addr, err)
+	}
+
+	s.mu.Lock()
+	if s.stopping {
+		s.mu.Unlock()
+		listener.Close()
+		return nil
+	}
+	s.listener = listener
+	s.mu.Unlock()
+
+	logging.App.Info("SFTP server listening", "addr", listener.Addr().String())
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			s.mu.Lock()
+			stopping := s.stopping
+			s.mu.Unlock()
+			if stopping {
+				return nil
+			}
+			return fmt.Errorf("accepting connection: %w", err)
+		}
+
+		s.wg.Add(1)
+		go s.handleConn(conn)
+	}
+}
+
+// Stop closes the listener and all active connections, then waits for
+// connection goroutines to finish.
+func (s *Server) Stop() error {
+	s.mu.Lock()
+	s.stopping = true
+	listener := s.listener
+	conns := make([]*ssh.ServerConn, 0, len(s.conns))
+	for c := range s.conns {
+		conns = append(conns, c)
+	}
+	s.mu.Unlock()
+
+	var err error
+	if listener != nil {
+		err = listener.Close()
+	}
+	for _, c := range conns {
+		c.Close()
+	}
+	s.wg.Wait()
+	return err
+}
+
+// Addr returns the listener address, or nil if the server is not listening.
+func (s *Server) Addr() net.Addr {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.listener == nil {
+		return nil
+	}
+	return s.listener.Addr()
+}
+
+// GetActiveConnections returns the current number of active connections
+func (s *Server) GetActiveConnections() int32 {
+	return s.activeConnections.Load()
+}
+
+// GetTotalConnections returns the total number of connections since server start
+func (s *Server) GetTotalConnections() int64 {
+	return s.totalConnections.Load()
+}
+
+// GetStartTime returns the server start time
+func (s *Server) GetStartTime() time.Time {
+	return s.startTime
+}
+
+func (s *Server) trackConn(conn *ssh.ServerConn, add bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if add {
+		s.conns[conn] = struct{}{}
+	} else {
+		delete(s.conns, conn)
+	}
+}
+
+func (s *Server) handleConn(conn net.Conn) {
+	defer s.wg.Done()
+	remoteAddr := conn.RemoteAddr().String()
+
+	if s.config.MaxConnections > 0 && s.activeConnections.Load() >= int32(s.config.MaxConnections) {
+		logging.App.Warn("Refusing SFTP connection: connection limit reached", "client_ip", remoteAddr, "max_connections", s.config.MaxConnections)
+		conn.Close()
+		return
+	}
+
+	s.activeConnections.Add(1)
+	s.totalConnections.Add(1)
+	logging.Access.LogAccess("connect", "", remoteAddr, "success", "protocol", "sftp")
+	defer func() {
+		s.activeConnections.Add(-1)
+		logging.Access.LogAccess("disconnect", "", remoteAddr, "success", "protocol", "sftp")
+	}()
+
+	tconn := &timeoutConn{Conn: conn, idle: s.config.IdleTimeout}
+	conn.SetDeadline(time.Now().Add(handshakeTimeout))
+
+	sconn, chans, reqs, err := ssh.NewServerConn(tconn, s.sshConfig)
+	if err != nil {
+		// Failed handshakes/auth are already logged by the auth callback
+		conn.Close()
+		return
+	}
+	tconn.activate()
+
+	s.trackConn(sconn, true)
+	defer s.trackConn(sconn, false)
+	defer sconn.Close()
+
+	go ssh.DiscardRequests(reqs)
+	s.handleChannels(sconn, chans)
+}
+
+// handleChannels accepts session channels and rejects everything else
+// (direct-tcpip forwarding, x11, agent, ...).
+func (s *Server) handleChannels(sconn *ssh.ServerConn, chans <-chan ssh.NewChannel) {
+	for newChannel := range chans {
+		if newChannel.ChannelType() != "session" {
+			newChannel.Reject(ssh.UnknownChannelType, "only session channels are supported")
+			continue
+		}
+
+		channel, requests, err := newChannel.Accept()
+		if err != nil {
+			continue
+		}
+		go s.handleSession(sconn.User(), channel, requests)
+	}
+}
+
+// handleSession services a session channel: only the sftp subsystem is
+// granted. Shell, exec (scp), pty-req, and everything else are refused, so
+// authenticated users can never obtain a shell.
+func (s *Server) handleSession(user string, channel ssh.Channel, requests <-chan *ssh.Request) {
+	defer channel.Close()
+
+	for req := range requests {
+		if req.Type == "subsystem" && subsystemName(req.Payload) == "sftp" {
+			req.Reply(true, nil)
+			go func() {
+				for r := range requests {
+					r.Reply(false, nil)
+				}
+			}()
+			s.serveSFTP(user, channel)
+			return
+		}
+		req.Reply(false, nil)
+	}
+}
+
+// subsystemName extracts the subsystem name from an SSH request payload
+// (a length-prefixed string).
+func subsystemName(payload []byte) string {
+	if len(payload) < 4 {
+		return ""
+	}
+	length := binary.BigEndian.Uint32(payload)
+	if uint32(len(payload)-4) < length {
+		return ""
+	}
+	return string(payload[4 : 4+length])
+}
+
+// serveSFTP runs an SFTP request server over the channel, jailed to RootDir
+// and starting in the user's home directory (mirroring the FTP driver).
+func (s *Server) serveSFTP(user string, channel ssh.Channel) {
+	fs := afero.NewBasePathFs(afero.NewOsFs(), s.config.RootDir)
+
+	home := "/"
+	if s.config.HomePattern != "" {
+		homePath := filepath.Clean(fmt.Sprintf(s.config.HomePattern, user))
+		if info, err := fs.Stat(homePath); err == nil && info.IsDir() {
+			home = filepath.Join("/", homePath)
+		}
+	}
+
+	server := sftp.NewRequestServer(channel, newHandlers(s, user, fs), sftp.WithStartDirectory(home))
+	if err := server.Serve(); err != nil && !errors.Is(err, io.EOF) {
+		logging.App.Debug("SFTP session ended", "user", user, "error", err)
+	}
+	server.Close()
+}
+
+// timeoutConn enforces the handshake deadline until activate is called, then
+// pushes an idle deadline forward on every read/write.
+type timeoutConn struct {
+	net.Conn
+	idle   time.Duration
+	active atomic.Bool
+}
+
+func (c *timeoutConn) touch() {
+	if c.active.Load() && c.idle > 0 {
+		c.Conn.SetDeadline(time.Now().Add(c.idle))
+	}
+}
+
+func (c *timeoutConn) Read(b []byte) (int, error) {
+	c.touch()
+	return c.Conn.Read(b)
+}
+
+func (c *timeoutConn) Write(b []byte) (int, error) {
+	c.touch()
+	return c.Conn.Write(b)
+}
+
+// activate switches from the handshake deadline to idle-timeout mode. The
+// deadline is reset immediately so a read blocked since the handshake picks
+// up the new deadline too.
+func (c *timeoutConn) activate() {
+	c.active.Store(true)
+	if c.idle > 0 {
+		c.Conn.SetDeadline(time.Now().Add(c.idle))
+	} else {
+		c.Conn.SetDeadline(time.Time{})
+	}
+}

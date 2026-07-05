@@ -13,6 +13,7 @@ import (
 	"github.com/mmcdole/viking-ftpd/pkg/authorization"
 	"github.com/mmcdole/viking-ftpd/pkg/ftpserver"
 	"github.com/mmcdole/viking-ftpd/pkg/logging"
+	"github.com/mmcdole/viking-ftpd/pkg/sftpserver"
 	"github.com/mmcdole/viking-ftpd/pkg/status"
 	"github.com/mmcdole/viking-ftpd/pkg/users"
 	"github.com/spf13/cobra"
@@ -51,6 +52,9 @@ Configuration file must be in JSON format with the following structure:
     "pasv_ip_verify": false,
     "tls_cert_file": "/path/to/cert.pem",
     "tls_key_file": "/path/to/key.pem",
+    "sftp_listen_addr": "0.0.0.0",
+    "sftp_port": 2022,
+    "ssh_host_key_file": "/path/to/vkftpd_host_key",
     "character_dir_path": "/mud/lib/characters",
     "access_file_path": "/mud/lib/dgd/sys/data/access.o",
     "character_cache_time": 60,
@@ -123,6 +127,23 @@ Configuration file must be in JSON format with the following structure:
 			return fmt.Errorf("failed to create FTP server: %w", err)
 		}
 
+		// Create SFTP server if enabled
+		var sftpServer *sftpserver.Server
+		if config.SFTPPort > 0 {
+			sftpServer, err = sftpserver.New(&sftpserver.Config{
+				ListenAddr:     config.SFTPListenAddr,
+				Port:           config.SFTPPort,
+				RootDir:        config.FTPRootDir,
+				HomePattern:    config.HomePattern,
+				HostKeyFile:    config.SSHHostKeyFile,
+				IdleTimeout:    time.Duration(config.IdleTimeout) * time.Second,
+				MaxConnections: config.MaxConnections,
+			}, authorizer, authenticator, version)
+			if err != nil {
+				return fmt.Errorf("failed to create SFTP server: %w", err)
+			}
+		}
+
 		// Initialize status writer if configured
 		var statusWriter *status.Writer
 		if config.StatusDir != "" {
@@ -131,7 +152,11 @@ Configuration file must be in JSON format with the following structure:
 				return fmt.Errorf("failed to create status writer: %w", err)
 			}
 
-			statusWriter.SetMetricsProvider(server)
+			providers := []status.MetricsProvider{server}
+			if sftpServer != nil {
+				providers = append(providers, sftpServer)
+			}
+			statusWriter.SetMetricsProvider(status.NewMultiProvider(providers...))
 
 			if err := statusWriter.WriteStartFile(); err != nil {
 				return fmt.Errorf("failed to write start file: %w", err)
@@ -143,17 +168,44 @@ Configuration file must be in JSON format with the following structure:
 			defer statusWriter.Shutdown("unexpected_exit")
 		}
 
-		logging.App.Info("Starting VikingMUD FTP Server", "version", version, "listen_addr", config.ListenAddr, "port", config.Port)
+		if sftpServer != nil {
+			logging.App.Info("Starting VikingMUD FTP Server", "version", version, "listen_addr", config.ListenAddr, "port", config.Port, "sftp_port", config.SFTPPort)
+		} else {
+			logging.App.Info("Starting VikingMUD FTP Server", "version", version, "listen_addr", config.ListenAddr, "port", config.Port)
+		}
 
 		// Set up signal handling for graceful shutdown
 		sigChan := make(chan os.Signal, 1)
 		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-		// Start server in goroutine
-		serverErr := make(chan error, 1)
+		// stopServers stops both servers, logging any errors
+		stopServers := func() error {
+			var stopErr error
+			if err := server.Stop(); err != nil {
+				logging.App.Error("Error stopping FTP server", "error", err)
+				stopErr = err
+			}
+			if sftpServer != nil {
+				if err := sftpServer.Stop(); err != nil {
+					logging.App.Error("Error stopping SFTP server", "error", err)
+					if stopErr == nil {
+						stopErr = err
+					}
+				}
+			}
+			return stopErr
+		}
+
+		// Start servers in goroutines
+		serverErr := make(chan error, 2)
 		go func() {
 			serverErr <- server.ListenAndServe()
 		}()
+		if sftpServer != nil {
+			go func() {
+				serverErr <- sftpServer.ListenAndServe()
+			}()
+		}
 
 		// Wait for signal or server error
 		select {
@@ -165,6 +217,9 @@ Configuration file must be in JSON format with the following structure:
 				}
 				statusWriter.Shutdown(reason)
 			}
+
+			// One server failed or stopped; bring the other down too
+			stopServers()
 
 			if err != nil {
 				logging.App.Error("Server error", "error", err)
@@ -183,8 +238,7 @@ Configuration file must be in JSON format with the following structure:
 			defer cancel()
 
 			// Stop accepting new connections and wait for existing ones
-			if err := server.Stop(); err != nil {
-				logging.App.Error("Error stopping server", "error", err)
+			if err := stopServers(); err != nil {
 				return fmt.Errorf("error stopping server: %w", err)
 			}
 
