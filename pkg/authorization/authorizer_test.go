@@ -205,7 +205,10 @@ func TestProductionExample(t *testing.T) {
 
 	t.Run("DefaultAccess", func(t *testing.T) {
 		cases := []testCase{
-			{"root_access", "anonymous", "/", Read},                    // Everyone can read root directory
+			// Root resolves to the default map's "*" (here Revoked). Real
+			// access.txt uses "*":1 so root is readable — see the real-data
+			// test in authorizer_mud_test.go.
+			{"root_access", "anonymous", "/", Revoked},
 			{"accounts_denied", "anonymous", "/accounts", Revoked},     // Accounts dir is private
 			{"characters_denied", "anonymous", "/characters", Revoked}, // Character data is private
 			{"data_denied", "anonymous", "/data/test", Revoked},        // Data dir is private
@@ -219,8 +222,11 @@ func TestProductionExample(t *testing.T) {
 	t.Run("DomainAccess", func(t *testing.T) {
 		cases := []testCase{
 			// Domain wizard permissions
-			{"realm_write", "wizard1", "/d/MyRealm/room.c", Write},           // Full write in own realm
-			{"shared_realm_root", "wizard1", "/d/SharedRealm", Write},        // Write at shared realm root
+			{"realm_write", "wizard1", "/d/MyRealm/room.c", Write}, // Full write in own realm
+			// wizard1's map has no "*" along this path, so the inherited
+			// default is 0 and the MUD uses the node's "*" (Read), not "."
+			// (Write), even for the directory itself.
+			{"shared_realm_root", "wizard1", "/d/SharedRealm", Read},
 			{"shared_realm_files", "wizard1", "/d/SharedRealm/room.c", Read}, // Only read in shared files
 		}
 		runTests(t, auth, cases)
@@ -240,7 +246,7 @@ func TestCorePermissions(t *testing.T) {
 
 	t.Run("DotVsStar", func(t *testing.T) {
 		cases := []testCase{
-			{"root_dot", "anonymous", "/", Read},               // Root dir is readable
+			{"root_dot", "anonymous", "/", Revoked},            // Root resolves to default "*" (Revoked here); real data uses "*":1
 			{"root_star", "anonymous", "/unknown", Revoked},    // Unknown paths are denied
 			{"public_dot", "anonymous", "/public", Read},       // Can read public dir
 			{"public_star", "anonymous", "/public/file", Read}, // Can read files in public
@@ -288,7 +294,9 @@ func TestCorePermissions(t *testing.T) {
 	t.Run("UserOverrides", func(t *testing.T) {
 		cases := []testCase{
 			{"simple_override", "user", "/override", Write}, // User overrides default Revoked
-			{"special_dot", "user", "/special", Write},      // User-specific dot permission
+			// No inherited default along this path, so "special" itself uses
+			// its "*" (Read), not its "." (Write).
+			{"special_dot", "user", "/special", Read},
 			{"special_star", "user", "/special/file", Read}, // User-specific star permission
 		}
 		runTests(t, auth, cases)
@@ -346,10 +354,11 @@ func TestImplicitPermissions(t *testing.T) {
 			{"wizard-other", "wizard", "/players/arch", Revoked},
 			{"wizard-open", "wizard", "/players/arch/open", Read},
 
-			// Open directory restrictions
-			{"open-subdir", "wizard", "/players/arch/open/subdir", Revoked},
+			// The "open" rule grants read to the open dir AND its contents
+			// (depth >= 3), but only when parts[2] == "open".
+			{"open-subdir", "wizard", "/players/arch/open/subdir", Read},
 			{"not-open", "wizard", "/players/arch/not_open", Revoked},
-			{"deep-open", "wizard", "/players/arch/deep/open", Revoked},
+			{"deep-open", "wizard", "/players/arch/deep/open", Revoked}, // "open" not at parts[2]
 
 			// Home directory trumps group permissions
 			{"home-trumps-group", "arch", "/players/arch/doc.txt", GrantGrant},   // Even with doc group, home dir wins
@@ -370,13 +379,14 @@ func TestImplicitPermissions(t *testing.T) {
 			{"junior-secure", "junior", "/secure", Write},
 			{"junior-domains", "junior", "/domains", GrantWrite},
 
-			// Elder (level 42) should not get junior arch permissions
-			{"elder-root", "elder", "/", Read},
+			// Elder (level 42) should not get junior arch permissions. Root
+			// resolves to the default "*" (Revoked here); real data uses "*":1.
+			{"elder-root", "elder", "/", Revoked},
 			{"elder-secure", "elder", "/secure", Revoked},
 			{"elder-domains", "elder", "/domains", Revoked},
 
 			// Regular wizard (level 31)
-			{"wizard-root", "wizard", "/", Read},
+			{"wizard-root", "wizard", "/", Revoked},
 			{"wizard-secure", "wizard", "/secure", Revoked},
 			{"wizard-domains", "wizard", "/domains", Revoked},
 		}

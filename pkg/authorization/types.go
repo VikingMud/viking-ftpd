@@ -39,19 +39,6 @@ func (p Permission) CanGrant() bool {
 	return p >= GrantGrant
 }
 
-// AccessTree represents a node in the access permission tree
-type AccessTree struct {
-	Root   *AccessNode
-	Groups []string
-}
-
-// AccessNode represents a node in the access tree
-type AccessNode struct {
-	DotAccess  Permission
-	StarAccess Permission
-	Children   map[string]*AccessNode
-}
-
 // Group constants
 const (
 	GroupArchFull   = "Arch_full"
