@@ -113,16 +113,17 @@ Configuration file must be in JSON format with the following structure:
 
 		// Create and start FTP server
 		server, err := ftpserver.New(&ftpserver.Config{
-			ListenAddr:    config.ListenAddr,
-			Port:          config.Port,
-			RootDir:       config.FTPRootDir,
-			HomePattern:   config.HomePattern,
-			TLSCertFile:   config.TLSCertFile,
-			TLSKeyFile:    config.TLSKeyFile,
-			PasvPortRange: config.PasvPortRange,
-			PasvAddress:   config.PasvAddress,
-			PasvIPVerify:  config.PasvIPVerify,
-			IdleTimeout:   config.IdleTimeout,
+			ListenAddr:     config.ListenAddr,
+			Port:           config.Port,
+			RootDir:        config.FTPRootDir,
+			HomePattern:    config.HomePattern,
+			TLSCertFile:    config.TLSCertFile,
+			TLSKeyFile:     config.TLSKeyFile,
+			PasvPortRange:  config.PasvPortRange,
+			PasvAddress:    config.PasvAddress,
+			PasvIPVerify:   config.PasvIPVerify,
+			IdleTimeout:    config.IdleTimeout,
+			MaxConnections: config.MaxConnections,
 		}, authorizer, authenticator, version)
 		if err != nil {
 			return fmt.Errorf("failed to create FTP server: %w", err)

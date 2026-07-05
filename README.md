@@ -93,7 +93,7 @@ Notes:
 - Only the `sftp` subsystem is served. Shell, exec, and port-forwarding requests are refused, so `ssh` gives no shell and `scp` (which uses exec) does not work — use `sftp`/SFTP-capable clients.
 - SFTP operations appear in the access log with the same `op=`/`status=` vocabulary as FTP (plus a `setstat` op for attribute changes); connect, disconnect, and login lines carry an extra `protocol=sftp` field. SFTP has no `chdir` operation (directory changes are client-side in the protocol).
 - Symlink and hardlink creation, and readlink, are refused. Client-requested ownership changes (chown) are accepted but ignored — there is no owner concept in the MUD's permission model.
-- `max_connections` is currently enforced for SFTP connections only; the FTP server does not yet apply it.
+- `max_connections` is enforced for both FTP and SFTP connections (each protocol counts its own connections against the limit).
 
 ### Caching and Logging
 - `character_cache_time`: How long to cache character data in seconds (default: 60)
