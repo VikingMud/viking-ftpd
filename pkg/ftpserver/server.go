@@ -28,6 +28,7 @@ type Config struct {
 	PasvPortRange [2]int // Range of ports for passive mode transfers
 	PasvAddress   string // Public IP for passive mode connections
 	PasvIPVerify  bool   // Whether to verify data connection IPs
+	IdleTimeout   int    // Connection idle timeout in seconds (0 = library default)
 }
 
 // Server wraps the FTP server with our custom auth
@@ -109,6 +110,7 @@ func (d *ftpDriver) GetSettings() (*ftpserverlib.Settings, error) {
 		},
 		TLSRequired:       ftpserverlib.ClearOrEncrypted,
 		DisableActiveMode: true,
+		IdleTimeout:       d.server.config.IdleTimeout,
 	}
 
 	if d.server.config.PasvAddress != "" {
@@ -310,17 +312,22 @@ func (c *ftpClient) DeleteFile(name string) error {
 // MakeDirectory implements directory creation
 // Interface: ftpserverlib.ClientDriver
 func (c *ftpClient) MakeDirectory(name string) error {
-	if !c.server.authorizer.CanWrite(c.user, name) {
-		logging.Access.LogAccess("mkdir", c.user, name, "denied", "error", os.ErrPermission)
-		return os.ErrPermission
-	}
-
-	if err := c.fs.Mkdir(name, 0755); err != nil {
-		logging.Access.LogAccess("mkdir", c.user, name, "error", "error", err)
+	path, err := c.resolvePath(name)
+	if err != nil {
 		return err
 	}
 
-	logging.Access.LogAccess("mkdir", c.user, name, "success")
+	if !c.server.authorizer.CanWrite(c.user, path) {
+		logging.Access.LogAccess("mkdir", c.user, path, "denied", "error", os.ErrPermission)
+		return os.ErrPermission
+	}
+
+	if err := c.fs.Mkdir(path, 0755); err != nil {
+		logging.Access.LogAccess("mkdir", c.user, path, "error", "error", err)
+		return err
+	}
+
+	logging.Access.LogAccess("mkdir", c.user, path, "success")
 	return nil
 }
 
@@ -428,9 +435,14 @@ func (c *ftpClient) Mkdir(name string, perm os.FileMode) error {
 		logging.Access.LogAccess("mkdir", c.user, path, "denied", "error", os.ErrPermission)
 		return os.ErrPermission
 	}
-	err = c.fs.Mkdir(name, perm)
+
+	if err := c.fs.Mkdir(path, perm); err != nil {
+		logging.Access.LogAccess("mkdir", c.user, path, "error", "error", err)
+		return err
+	}
+
 	logging.Access.LogAccess("mkdir", c.user, path, "success", "mode", "write")
-	return err
+	return nil
 }
 
 // MkdirAll creates a directory and all parent directories
@@ -572,8 +584,13 @@ func (c *ftpClient) Chown(name string, uid, gid int) error {
 // Chtimes changes file times
 // Interface: afero.Fs
 func (c *ftpClient) Chtimes(name string, atime time.Time, mtime time.Time) error {
-	if !c.server.authorizer.CanWrite(c.user, name) {
+	path, err := c.resolvePath(name)
+	if err != nil {
+		return err
+	}
+
+	if !c.server.authorizer.CanWrite(c.user, path) {
 		return os.ErrPermission
 	}
-	return c.fs.Chtimes(name, atime, mtime)
+	return c.fs.Chtimes(path, atime, mtime)
 }
