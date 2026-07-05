@@ -1,168 +1,155 @@
+// Package lpc parses the LPC serialized object format used by DGD/LPMuds to
+// store object state (e.g. character files and the MUD's access map).
+//
+// A file is a sequence of "key value" lines. Values are strings, integers,
+// floats, arrays ({size|...}), mappings ([size|k:v,...]), or nil. The parser is
+// a hand-written recursive descent parser over a byte cursor: the format is
+// entirely ASCII-delimited, and UTF-8 payload inside string values is preserved
+// byte for byte.
 package lpc
 
 import (
 	"fmt"
 	"strconv"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 )
 
-// ObjectParser holds parsing configuration for LPC object format.
-// The format is used to store and restore object state in DGD.
+// ObjectParser parses whole objects. In strict mode the first error aborts the
+// parse; otherwise per-line errors are collected and parsing continues.
 type ObjectParser struct {
 	strict bool
 }
 
-// NewObjectParser creates a new parser with the given options.
-// In strict mode, any parsing error will stop the entire process.
-// In non-strict mode, errors are collected and parsing continues.
+// NewObjectParser creates a parser. See ObjectParser for the strict flag.
 func NewObjectParser(strict bool) *ObjectParser {
-	return &ObjectParser{
-		strict: strict,
-	}
+	return &ObjectParser{strict: strict}
 }
 
-// ParseError represents an error that occurred while parsing a specific line
+// ParseError is a parse failure located to a line and column (both 1-based).
 type ParseError struct {
-	Line     int   // The line number where the error occurred
-	Position int   // Position within the line where the error occurred
-	Err      error // The specific error encountered
+	Line   int
+	Column int
+	Err    error
 }
 
 func (e *ParseError) Error() string {
-	return fmt.Sprintf("Format error at line %d: %v", e.Line, e.Err)
+	return fmt.Sprintf("format error at line %d, column %d: %v", e.Line, e.Column, e.Err)
 }
 
-// ParseResult contains both the parsed object and any errors encountered.
-// In strict mode, Errors will be empty as any error stops parsing.
-// In non-strict mode, Errors may contain multiple parsing errors.
+// ParseResult holds the parsed object and, in non-strict mode, any per-line
+// errors that were skipped.
 type ParseResult struct {
-	Object map[string]interface{} // Key-value pairs from the object
-	Errors []*ParseError          // Any errors encountered during parsing
+	Object map[string]interface{}
+	Errors []*ParseError
 }
 
-// LineParser handles parsing of individual lines in LPC object format.
-// The format requires:
-// - No leading or trailing whitespace
-// - Exactly one space between key and value
-// - No tabs
-// - Keys must be valid identifiers
-type LineParser struct {
-	s   string // input string
-	pos int    // current position in string
-	w   int    // width of last rune read
-}
-
-// NewLineParser creates a new parser for a single line
-func NewLineParser(line string) *LineParser {
-	return &LineParser{
-		s:   line,
-		pos: 0,
-		w:   0,
-	}
-}
-
-// ParseObject parses an LPC object from the input string.
-// The input should consist of key-value pairs, one per line.
-// Empty lines and lines starting with # are ignored.
-// Returns error if input is empty or invalid.
+// ParseObject parses an object from input. Blank lines and lines beginning with
+// '#' are ignored. In strict mode any error returns immediately; otherwise
+// errors are collected in the result and only a wholly unparseable input is an
+// error.
 func (p *ObjectParser) ParseObject(input string) (result *ParseResult, err error) {
-	// Never let a malformed object crash the caller. This parser runs on
-	// machine-generated files (the access tree, character files) that can be
-	// read mid-write; a panic here would otherwise take down the daemon, since
-	// the SFTP request server does not recover per-operation.
+	// A malformed object must never crash the caller: this runs on
+	// machine-generated files that can be read mid-write, and the SFTP request
+	// server does not recover per-operation. The byte cursor is bounds-safe, so
+	// this is defense in depth rather than load-bearing.
 	defer func() {
 		if r := recover(); r != nil {
-			result = nil
-			err = fmt.Errorf("panic while parsing object: %v", r)
+			result, err = nil, fmt.Errorf("panic while parsing object: %v", r)
 		}
 	}()
 
-	if len(input) == 0 {
+	if input == "" {
 		return nil, fmt.Errorf("input string is empty")
 	}
 
-	result = &ParseResult{
-		Object: make(map[string]interface{}),
-		Errors: make([]*ParseError, 0),
-	}
-
-	lines := strings.Split(input, "\n")
-	startPos := 0
-
-	for lineNum, line := range lines {
-		// Skip empty lines and comments
-		if len(line) == 0 || line[0] == '#' {
-			startPos += len(line) + 1 // +1 for newline
+	result = &ParseResult{Object: make(map[string]interface{})}
+	for lineNum, line := range strings.Split(input, "\n") {
+		if line == "" || line[0] == '#' {
 			continue
 		}
 
-		// Parse key and value
-		lp := NewLineParser(line)
-		key, value, err := lp.ParseLine()
-		if err != nil {
-			parseErr := &ParseError{
-				Line:     lineNum + 1,
-				Position: startPos + lp.pos,
-				Err:      err,
-			}
-
+		lp := newLineParser(line)
+		key, value, lineErr := lp.parseLine()
+		if lineErr != nil {
+			pe := &ParseError{Line: lineNum + 1, Column: lp.pos + 1, Err: lineErr}
 			if p.strict {
-				return nil, parseErr
+				return nil, pe
 			}
-			result.Errors = append(result.Errors, parseErr)
-		} else {
-			result.Object[key] = value
+			result.Errors = append(result.Errors, pe)
+			continue
 		}
-
-		startPos += len(line) + 1 // +1 for newline
+		result.Object[key] = value
 	}
 
 	if len(result.Object) == 0 && len(result.Errors) > 0 {
-		return result, fmt.Errorf("no valid entries found")
+		return nil, fmt.Errorf("no valid entries found")
 	}
-
 	return result, nil
 }
 
-// ParseLine parses a single line of LPC object format, returning the key and value.
-// Format rules:
-// - Lines starting with # are treated as comments and skipped
-// - Empty lines are skipped
-// - No leading or trailing whitespace allowed
-// - Exactly one space between key and value
-// - No tabs allowed
-// - Line must end with newline or EOF
-func (p *LineParser) ParseLine() (string, interface{}, error) {
-	// Skip comment lines
-	if p.peek(0) == '#' {
-		return "", nil, nil
+// lineParser is a byte cursor over a single line.
+type lineParser struct {
+	s   string
+	pos int
+}
+
+func newLineParser(line string) *lineParser {
+	return &lineParser{s: line}
+}
+
+// peek returns the byte n positions ahead of the cursor, or 0 at end of input.
+func (p *lineParser) peek(n int) byte {
+	if i := p.pos + n; i < len(p.s) {
+		return p.s[i]
+	}
+	return 0
+}
+
+// accept consumes the next byte if it equals b.
+func (p *lineParser) accept(b byte) bool {
+	if p.peek(0) == b {
+		p.pos++
+		return true
+	}
+	return false
+}
+
+// match consumes prefix s if the cursor is positioned at it.
+func (p *lineParser) match(s string) bool {
+	if strings.HasPrefix(p.s[p.pos:], s) {
+		p.pos += len(s)
+		return true
+	}
+	return false
+}
+
+// skipSpaces advances past spaces and tabs.
+func (p *lineParser) skipSpaces() {
+	for p.peek(0) == ' ' || p.peek(0) == '\t' {
+		p.pos++
+	}
+}
+
+// parseLine parses one "key value" line and returns the key and value.
+func (p *lineParser) parseLine() (string, interface{}, error) {
+	switch p.peek(0) {
+	case '#', '\n', 0:
+		return "", nil, nil // comment or empty line
+	case ' ', '\t':
+		return "", nil, fmt.Errorf("leading whitespace not allowed")
 	}
 
-	// Skip empty lines
-	if p.peek(0) == '\n' || p.peek(0) == 0 {
-		return "", nil, nil
-	}
-
-	// Leading whitespace is not allowed
-	if p.peek(0) == ' ' || p.peek(0) == '\t' {
-		return "", nil, fmt.Errorf("leading whitespace not allowed at position %d", p.pos)
-	}
-
-	// Parse identifier - must start with letter or underscore
 	key, err := p.parseIdentifier()
 	if err != nil {
 		return "", nil, err
 	}
 
-	// Check for exactly one space after key
-	if p.peek(0) != ' ' {
-		return "", nil, fmt.Errorf("expected single space after key at position %d", p.pos)
+	if !p.accept(' ') {
+		return "", nil, fmt.Errorf("expected a single space after the key")
 	}
-	p.next() // consume the single space
 	if p.peek(0) == ' ' || p.peek(0) == '\t' {
-		return "", nil, fmt.Errorf("multiple spaces or tabs not allowed at position %d", p.pos)
+		return "", nil, fmt.Errorf("only a single space is allowed after the key")
 	}
 
 	value, err := p.parseValue()
@@ -170,219 +157,320 @@ func (p *LineParser) ParseLine() (string, interface{}, error) {
 		return "", nil, err
 	}
 
-	// Check for trailing whitespace
-	r := p.peek(0)
-	if r == ' ' || r == '\t' {
-		return "", nil, fmt.Errorf("trailing whitespace not allowed at position %d", p.pos)
+	switch p.peek(0) {
+	case ' ', '\t':
+		return "", nil, fmt.Errorf("trailing whitespace not allowed")
+	case '\n', 0:
+		return key, value, nil
+	default:
+		return "", nil, fmt.Errorf("expected end of line")
 	}
-	if r != '\n' && r != 0 {
-		return "", nil, fmt.Errorf("expected newline or end of file at position %d", p.pos)
-	}
-
-	return key, value, nil
 }
 
-// parseValue parses any valid value type.
-// Value types can be:
-// - Strings (double-quoted)
-// - Integers
-// - Floats (with optional hex notation)
-// - Arrays
-// - Maps
-// - nil
-func (p *LineParser) parseValue() (interface{}, error) {
+// parseValue parses any value, dispatching on the leading byte.
+func (p *lineParser) parseValue() (interface{}, error) {
 	p.skipSpaces()
 
-	r := p.peek(0)
-	if r == '"' {
+	switch b := p.peek(0); {
+	case b == '"':
 		return p.parseString()
-	} else if unicode.IsDigit(r) || r == '-' {
+	case b == '-' || isDigit(b):
 		return p.parseNumber()
-	} else if r == '(' {
-		// Could be array or map
-		if p.peek(1) == '{' {
+	case b == '(':
+		switch p.peek(1) {
+		case '{':
 			return p.parseArray()
-		} else if p.peek(1) == '[' {
+		case '[':
 			return p.parseMap()
 		}
-		return nil, fmt.Errorf("invalid value starting with '(' at position %d", p.pos)
-	} else if r == 'n' {
-		// Try parsing nil
-		pos := p.pos
-		if p.match("nil") && p.isValidTerminator(p.peek(0)) {
+		return nil, fmt.Errorf("expected '({' or '([' after '('")
+	case b == 'n':
+		start := p.pos
+		if p.match("nil") && isTerminator(p.peek(0)) {
 			return nil, nil
 		}
-		p.pos = pos
-		return nil, fmt.Errorf("invalid nil value at position %d", p.pos)
+		p.pos = start
+		return nil, fmt.Errorf("invalid nil value")
 	}
-
-	return nil, fmt.Errorf("invalid value starting with '%c' at position %d", r, p.pos)
+	return nil, fmt.Errorf("unexpected character %q", string(p.peek(0)))
 }
 
-func (p *LineParser) isValidTerminator(r rune) bool {
-	return r == ',' || r == ':' || r == ']' || r == '}' || r == ')' || r == '\n' || r == 0
+// parseString parses a double-quoted string with escape sequences. Unknown
+// escapes are taken literally (matching DGD). Newlines are not allowed.
+func (p *lineParser) parseString() (string, error) {
+	if !p.accept('"') {
+		return "", fmt.Errorf(`expected '"'`)
+	}
+
+	var b strings.Builder
+	for p.pos < len(p.s) {
+		c := p.s[p.pos]
+		p.pos++
+		switch c {
+		case '"':
+			return b.String(), nil
+		case '\n':
+			return "", fmt.Errorf("newline in string")
+		case '\\':
+			if p.pos >= len(p.s) {
+				return "", fmt.Errorf("unterminated string")
+			}
+			if esc, ok := escapeSequences[p.s[p.pos]]; ok {
+				p.pos++
+				b.WriteByte(esc)
+			} else {
+				// Unknown escape: take the next character literally, decoding a
+				// full rune so multibyte content survives.
+				r, w := utf8.DecodeRuneInString(p.s[p.pos:])
+				p.pos += w
+				b.WriteRune(r)
+			}
+		default:
+			b.WriteByte(c) // raw byte; preserves UTF-8 payload
+		}
+	}
+	return "", fmt.Errorf("unterminated string")
 }
 
-// parseArray parses an array value.
-// Format: ({size|val1,val2,...})
-// - Size must match the number of elements
-// - Elements are comma-separated with no trailing comma
-// - Arrays can be nested
-func (p *LineParser) parseArray() ([]interface{}, error) {
-	if !p.match("({") {
-		return nil, fmt.Errorf("error in array: expected '({' at position %d", p.pos)
+// parseNumber parses an integer or a float. Floats are [-]digits[.digits] with
+// an optional "=hexdigits" tail holding the exact IEEE-754 bits, which DGD
+// emits and which we parse from the decimal form and otherwise ignore.
+func (p *lineParser) parseNumber() (interface{}, error) {
+	start := p.pos
+	p.accept('-')
+
+	intDigits := 0
+	for isDigit(p.peek(0)) {
+		p.pos++
+		intDigits++
 	}
 
-	// Parse size
-	size, err := p.parseInt()
-	if err != nil {
-		return nil, fmt.Errorf("error in array: invalid size at position %d: %v", p.pos, err)
-	}
-
-	if !p.expect('|') {
-		return nil, fmt.Errorf("error in array: expected '|' after size at position %d", p.pos)
-	}
-
-	// Parse elements
-	elements := make([]interface{}, 0)
-
-	// Handle empty array cases (with or without trailing comma)
-	p.skipSpaces()
-	if p.peek(0) == '}' && p.peek(1) == ')' {
-		p.pos += 2
-		if size != 0 {
-			return nil, fmt.Errorf("error in array: empty array but size is %d", size)
+	isFloat := false
+	if p.accept('.') {
+		isFloat = true
+		fracDigits := 0
+		for isDigit(p.peek(0)) {
+			p.pos++
+			fracDigits++
 		}
-		return elements, nil
-	}
-	if p.peek(0) == ',' && p.peek(1) == '}' && p.peek(2) == ')' {
-		p.pos += 3
-		if size != 0 {
-			return nil, fmt.Errorf("error in array: empty array but size is %d", size)
+		if fracDigits == 0 {
+			return nil, fmt.Errorf("float must have digits after the decimal point")
 		}
-		return elements, nil
+	}
+	if p.accept('=') {
+		isFloat = true
+		hexDigits := 0
+		for isHexDigit(p.peek(0)) {
+			p.pos++
+			hexDigits++
+		}
+		if hexDigits == 0 {
+			return nil, fmt.Errorf("float must have hex digits after '='")
+		}
 	}
 
-	// Parse elements
-	for {
-		// Parse element
-		element, err := p.parseValue()
+	tok := p.s[start:p.pos]
+	if isFloat {
+		if intDigits == 0 {
+			return nil, fmt.Errorf("float must start with a digit")
+		}
+		decimal := tok
+		if i := strings.IndexByte(decimal, '='); i >= 0 {
+			decimal = decimal[:i] // drop the hex-bits tail
+		}
+		f, err := strconv.ParseFloat(decimal, 64)
 		if err != nil {
-			return nil, fmt.Errorf("error in array: %v", err)
+			return nil, fmt.Errorf("invalid float %q", tok)
 		}
-		elements = append(elements, element)
+		return f, nil
+	}
+
+	n, err := strconv.Atoi(tok)
+	if err != nil {
+		return nil, fmt.Errorf("invalid integer %q", tok)
+	}
+	return n, nil
+}
+
+// parseCount parses a non-negative element/entry count.
+func (p *lineParser) parseCount() (int, error) {
+	start := p.pos
+	for isDigit(p.peek(0)) {
+		p.pos++
+	}
+	if p.pos == start {
+		return 0, fmt.Errorf("expected a count")
+	}
+	return strconv.Atoi(p.s[start:p.pos])
+}
+
+// parseArray parses an array: ({size|v1,v2,...}). size must match the element
+// count. A single trailing comma is allowed.
+func (p *lineParser) parseArray() ([]interface{}, error) {
+	if !p.match("({") {
+		return nil, fmt.Errorf("array: expected '({'")
+	}
+	size, err := p.parseCount()
+	if err != nil {
+		return nil, fmt.Errorf("array: %w", err)
+	}
+	if !p.accept('|') {
+		return nil, fmt.Errorf("array: expected '|' after size")
+	}
+
+	elements := []interface{}{}
+
+	p.skipSpaces()
+	if p.match("})") || p.match(",})") { // empty, optionally with trailing comma
+		if size != 0 {
+			return nil, fmt.Errorf("array: empty but size is %d", size)
+		}
+		return elements, nil
+	}
+
+	for {
+		el, err := p.parseValue()
+		if err != nil {
+			return nil, fmt.Errorf("array: %w", err)
+		}
+		elements = append(elements, el)
 
 		p.skipSpaces()
-		if p.peek(0) == ',' {
-			p.pos++ // consume comma
+		if p.accept(',') {
 			p.skipSpaces()
-			// Check for trailing comma
-			if p.peek(0) == '}' && p.peek(1) == ')' {
-				p.pos += 2
+			if p.match("})") { // trailing comma
 				break
 			}
 			continue
-		} else if p.peek(0) == '}' && p.peek(1) == ')' {
-			p.pos += 2
-			break
-		} else {
-			return nil, fmt.Errorf("error in array: expected ',' or '})' at position %d", p.pos)
 		}
+		if p.match("})") {
+			break
+		}
+		return nil, fmt.Errorf("array: expected ',' or '})'")
 	}
 
-	// Verify size matches number of elements
-	if len(elements) > size {
-		return nil, fmt.Errorf("error in array: too many elements, expected %d", size)
-	} else if len(elements) < size {
-		return nil, fmt.Errorf("error in array: too few elements, expected %d", size)
+	if len(elements) != size {
+		return nil, fmt.Errorf("array: expected %d elements, got %d", size, len(elements))
 	}
-
 	return elements, nil
 }
 
-// parseMap parses a mapping value.
-// Format: ([size|key1:val1,key2:val2,...])
-// - Size must match the number of entries
-// - Entries are comma-separated with no trailing comma
-// - Keys can be any valid value type
-// - Values can be any valid value type
-// - Mappings can be nested
-func (p *LineParser) parseMap() (map[string]interface{}, error) {
+// parseMap parses a mapping: ([size|k1:v1,k2:v2,...]). size counts all entries
+// including complex-keyed ones that are skipped. A single trailing comma is
+// allowed.
+func (p *lineParser) parseMap() (map[string]interface{}, error) {
 	if !p.match("([") {
-		return nil, fmt.Errorf("error in map: expected '([' at position %d", p.pos)
+		return nil, fmt.Errorf("map: expected '(['")
 	}
-
-	// Parse size
-	size, err := p.parseInt()
+	size, err := p.parseCount()
 	if err != nil {
-		return nil, fmt.Errorf("error in map: invalid size at position %d: %v", p.pos, err)
+		return nil, fmt.Errorf("map: %w", err)
+	}
+	if !p.accept('|') {
+		return nil, fmt.Errorf("map: expected '|' after size")
 	}
 
-	if !p.expect('|') {
-		return nil, fmt.Errorf("error in map: expected '|' after size at position %d", p.pos)
-	}
-
-	// Parse entries
 	result := make(map[string]interface{})
-	totalEntries := 0
-	validEntries := 0
 
-	// Handle empty map
 	p.skipSpaces()
-	if p.peek(0) == ']' && p.peek(1) == ')' {
-		p.pos += 2
+	if p.match("])") {
 		if size != 0 {
-			return nil, fmt.Errorf("error in map: empty map but size is %d", size)
+			return nil, fmt.Errorf("map: empty but size is %d", size)
 		}
 		return result, nil
 	}
 
+	total := 0
 	for {
-		// Parse key:value pair
 		key, value, skipped, err := p.parseMapEntry()
 		if err != nil {
 			return nil, err
 		}
-
-		totalEntries++
+		total++
 		if !skipped {
 			result[key] = value
-			validEntries++
 		}
 
 		p.skipSpaces()
-		if p.peek(0) == ',' {
-			p.pos++ // consume comma
+		if p.accept(',') {
 			p.skipSpaces()
-			if p.peek(0) == ']' && p.peek(1) == ')' {
-				p.pos += 2
+			if p.match("])") { // trailing comma
 				break
 			}
 			continue
-		} else if p.peek(0) == ']' && p.peek(1) == ')' {
-			p.pos += 2
-			break
-		} else {
-			return nil, fmt.Errorf("error in map: expected ',' or '])' at position %d", p.pos)
 		}
+		if p.match("])") {
+			break
+		}
+		return nil, fmt.Errorf("map: expected ',' or '])'")
 	}
 
-	// Verify size matches total number of entries (including skipped ones)
-	if totalEntries > size {
-		return nil, fmt.Errorf("error in map: too many entries, expected %d", size)
-	} else if totalEntries < size {
-		return nil, fmt.Errorf("error in map: too few entries, expected %d", size)
+	if total != size {
+		return nil, fmt.Errorf("map: expected %d entries, got %d", size, total)
 	}
-
-	// If we have no valid entries but size > 0, that means all entries were skipped
-	if validEntries == 0 && size > 0 {
-		return make(map[string]interface{}), nil
-	}
-
 	return result, nil
 }
 
-var escapeSequences = map[rune]rune{
+// parseMapEntry parses one key:value pair. Keys must be primitive (string,
+// number, or nil); array/map keys are unsupported and the entry is skipped
+// (skipped == true) but still counted toward the map size.
+func (p *lineParser) parseMapEntry() (key string, value interface{}, skipped bool, err error) {
+	p.skipSpaces()
+
+	rawKey, err := p.parseValue()
+	if err != nil {
+		return "", nil, false, fmt.Errorf("map entry: invalid key: %w", err)
+	}
+
+	switch k := rawKey.(type) {
+	case string:
+		key = k
+	case int:
+		key = strconv.Itoa(k)
+	case float64:
+		key = strconv.FormatFloat(k, 'f', -1, 64)
+	case nil:
+		key = "nil"
+	case []interface{}, map[string]interface{}:
+		p.skipSpaces()
+		if p.accept(':') {
+			if _, err := p.parseValue(); err != nil { // consume and discard
+				return "", nil, false, err
+			}
+		}
+		return "", nil, true, nil
+	default:
+		return "", nil, false, fmt.Errorf("map entry: unsupported key type %T", rawKey)
+	}
+
+	p.skipSpaces()
+	if !p.accept(':') {
+		return "", nil, false, fmt.Errorf("map entry: expected ':' after key")
+	}
+
+	value, err = p.parseValue()
+	if err != nil {
+		return "", nil, false, err
+	}
+	return key, value, false, nil
+}
+
+// parseIdentifier parses a key: an ASCII letter followed by letters, digits,
+// and underscores.
+func (p *lineParser) parseIdentifier() (string, error) {
+	start := p.pos
+	if !isLetter(p.peek(0)) {
+		return "", fmt.Errorf("identifier must start with a letter")
+	}
+	p.pos++
+	for isIdentChar(p.peek(0)) {
+		p.pos++
+	}
+	return p.s[start:p.pos], nil
+}
+
+// escapeSequences maps the character after a backslash to its literal byte.
+var escapeSequences = map[byte]byte{
 	'0':  0,
 	'a':  '\a',
 	'b':  '\b',
@@ -395,277 +483,20 @@ var escapeSequences = map[rune]rune{
 	'\\': '\\',
 }
 
-func isHexDigit(r rune) bool {
-	return (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')
+func isDigit(b byte) bool  { return b >= '0' && b <= '9' }
+func isLetter(b byte) bool { return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') }
+
+func isIdentChar(b byte) bool { return isLetter(b) || isDigit(b) || b == '_' }
+
+func isHexDigit(b byte) bool {
+	return isDigit(b) || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
 }
 
-// ParseMapEntry parses a single key:value pair in a mapping.
-// While the LPC Object Format specification allows any valid value type as keys,
-// this implementation only supports primitive types (strings, numbers, and nil) as keys.
-// Complex types (arrays and maps) as keys will be skipped during parsing.
-// Keys can be:
-// - Strings
-// - Integers
-// - Floats
-// - nil
-// Values can be any valid value type.
-func (p *LineParser) parseMapEntry() (string, interface{}, bool, error) {
-	p.skipSpaces()
-
-	// Parse key - can be any valid value type
-	keyValue, err := p.parseValue()
-	if err != nil {
-		return "", nil, false, fmt.Errorf("error in map entry: invalid key at position %d: %v", p.pos, err)
-	}
-
-	// Convert key to string representation
-	var key string
-	switch v := keyValue.(type) {
-	case string:
-		key = v
-	case int:
-		key = strconv.Itoa(v)
-	case float64:
-		key = strconv.FormatFloat(v, 'f', -1, 64)
-	case []interface{}, map[string]interface{}:
-		// Skip array and map keys but count them
-		p.skipSpaces()
-		if p.peek(0) == ':' {
-			p.next() // skip :
-			// Parse and discard the value
-			if _, err := p.parseValue(); err != nil {
-				return "", nil, false, err
-			}
-		}
-		return "", nil, true, nil
-	case nil:
-		key = "nil"
-	default:
-		return "", nil, false, fmt.Errorf("error in map entry: unsupported key type %T at position %d", keyValue, p.pos)
-	}
-
-	p.skipSpaces()
-	if !p.expect(':') {
-		return "", nil, false, fmt.Errorf("error in map entry: expected ':' after key at position %d", p.pos)
-	}
-
-	// Parse value
-	value, err := p.parseValue()
-	if err != nil {
-		return "", nil, false, err
-	}
-
-	return key, value, false, nil
-}
-
-// ParseNumber parses either an integer or float value.
-// Floats may include hex notation after = sign.
-// Format: [-]digits[.digits][=hexdigits]
-func (p *LineParser) parseNumber() (interface{}, error) {
-	// Look ahead to see if this is a float
-	offset := 0
-	if p.peek(offset) == '-' {
-		offset++
-	}
-	// Skip digits
-	for unicode.IsDigit(p.peek(offset)) {
-		offset++
-	}
-	// Check for decimal point or hex notation
-	if p.peek(offset) == '.' || p.peek(offset) == '=' {
-		return p.parseFloat()
-	}
-	return p.parseInt()
-}
-
-// ParseInt parses an integer from the input string
-func (p *LineParser) parseInt() (int, error) {
-	start := p.pos
-	if p.peek(0) == '-' {
-		p.next()
-	}
-	for unicode.IsDigit(p.peek(0)) {
-		p.next()
-	}
-
-	result, err := strconv.Atoi(p.s[start:p.pos])
-	if err != nil {
-		return 0, fmt.Errorf("error in integer: invalid number at position %d", p.pos)
-	}
-	return result, nil
-}
-
-// next returns the next rune and advances the position
-func (p *LineParser) next() rune {
-	if p.pos >= len(p.s) {
-		p.w = 0
-		return 0
-	}
-	r, w := utf8.DecodeRuneInString(p.s[p.pos:])
-	p.pos += w
-	p.w = w
-	return r
-}
-
-// Peek returns the rune at the current position without advancing the position
-func (p *LineParser) peek(n int) rune {
-	if p.pos+n >= len(p.s) {
-		return 0
-	}
-	r, _ := utf8.DecodeRuneInString(p.s[p.pos+n:])
-	return r
-}
-
-// Expect checks if the next rune matches the given rune and advances the position if it does
-func (p *LineParser) expect(r rune) bool {
-	if p.next() == r {
-		return true
-	}
-	p.pos -= p.w
-	return false
-}
-
-// SkipSpaces skips any whitespace characters
-func (p *LineParser) skipSpaces() {
-	for {
-		r := p.peek(0)
-		if r != ' ' && r != '\t' {
-			break
-		}
-		p.next()
-	}
-}
-
-// match checks if the next runes match the given string and advances the position if they do
-func (p *LineParser) match(s string) bool {
-	// Bounds check: a truncated value (e.g. a line ending in "n" while trying
-	// to match "nil") must not slice past the end of the input and panic.
-	if p.pos+len(s) > len(p.s) {
-		return false
-	}
-	if p.s[p.pos:p.pos+len(s)] == s {
-		p.pos += len(s)
+// isTerminator reports whether b can validly follow a bare value (nil).
+func isTerminator(b byte) bool {
+	switch b {
+	case ',', ':', ']', '}', ')', '\n', 0:
 		return true
 	}
 	return false
-}
-
-// parseFloat parses a float value, optionally with hex notation.
-// Format: [-]digits[.digits][=hexdigits]
-// The hex part represents the IEEE 754 bits of the float.
-func (p *LineParser) parseFloat() (float64, error) {
-	start := p.pos
-
-	if p.peek(0) == '-' {
-		p.next()
-	}
-
-	// Must have at least one digit
-	if !unicode.IsDigit(p.peek(0)) {
-		return 0, fmt.Errorf("float value must start with a digit at position %d", p.pos)
-	}
-
-	// Parse integer part
-	for unicode.IsDigit(p.peek(0)) {
-		p.next()
-	}
-
-	// Parse optional decimal part
-	if p.peek(0) == '.' {
-		p.next()
-		// Must have at least one digit after the decimal point
-		if !unicode.IsDigit(p.peek(0)) {
-			return 0, fmt.Errorf("float value must have digits after decimal point at position %d", p.pos)
-		}
-		for unicode.IsDigit(p.peek(0)) {
-			p.next()
-		}
-	}
-
-	// If no decimal point or hex notation, it must have hex notation
-	if p.peek(0) != '=' && !strings.Contains(p.s[start:p.pos], ".") {
-		return 0, fmt.Errorf("float value must contain a decimal point or hex representation at position %d", p.pos)
-	}
-
-	floatStr := p.s[start:p.pos]
-	result, err := strconv.ParseFloat(floatStr, 64)
-	if err != nil {
-		return 0, fmt.Errorf("error in float: invalid number at position %d", p.pos)
-	}
-
-	// Parse optional hex part
-	if p.peek(0) == '=' {
-		p.next() // skip =
-		if !isHexDigit(p.peek(0)) {
-			return 0, fmt.Errorf("invalid hex digits after = at position %d", p.pos)
-		}
-		for isHexDigit(p.peek(0)) {
-			p.next()
-		}
-	}
-
-	return result, nil
-}
-
-// ParseString parses a double-quoted string with escape sequences.
-// Supported escape sequences:
-// - \0  - null character
-// - \a  - bell (BEL)
-// - \b  - backspace
-// - \t  - tab
-// - \n  - newline
-// - \v  - vertical tab
-// - \f  - form feed
-// - \r  - carriage return
-// - \"  - double quote
-// - \\  - backslash
-// Any other character after backslash is taken literally.
-// Newlines are not allowed in strings.
-func (p *LineParser) parseString() (string, error) {
-	if !p.match("\"") {
-		return "", fmt.Errorf("expected '\"' at position %d", p.pos)
-	}
-
-	var b strings.Builder
-	for p.pos < len(p.s) {
-		r := p.next()
-		if r == '"' {
-			return b.String(), nil
-		}
-		if r == '\\' {
-			if p.pos >= len(p.s) {
-				return "", fmt.Errorf("unterminated string at position %d", p.pos)
-			}
-			r = p.next()
-			if escaped, ok := escapeSequences[r]; ok {
-				b.WriteRune(escaped)
-			} else {
-				b.WriteRune(r) // Unknown escape sequences are taken literally
-			}
-			continue
-		}
-		if r == '\n' {
-			return "", fmt.Errorf("newline in string at position %d", p.pos)
-		}
-		b.WriteRune(r)
-	}
-	return "", fmt.Errorf("unterminated string at position %d", p.pos)
-}
-
-// ParseIdentifier parses an identifier from the input string.
-// An identifier consists of letters, digits, and underscores.
-// The first character must be a letter.
-func (p *LineParser) parseIdentifier() (string, error) {
-	start := p.pos
-	r := p.next()
-	if !unicode.IsLetter(r) {
-		return "", fmt.Errorf("identifier must start with a letter at position %d", p.pos)
-	}
-	for r = p.next(); unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'; r = p.next() {
-		if r == 0 {
-			return "", fmt.Errorf("unexpected end of input while parsing identifier at position %d", p.pos)
-		}
-	}
-	p.pos -= p.w // back up to last character of identifier
-	return p.s[start:p.pos], nil
 }
