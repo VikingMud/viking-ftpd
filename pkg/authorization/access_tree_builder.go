@@ -114,16 +114,25 @@ func buildAccessNode(data map[string]interface{}) (*AccessNode, []string, error)
 	return node, groups, nil
 }
 
-// parsePermission converts a raw permission value into a Permission
+// parsePermission converts a raw permission value into a Permission and
+// rejects values outside the defined range, so a malformed access tree fails
+// to build rather than silently granting (e.g. a stray 7 reading as CanGrant)
+// or blocking resolution with a nonsense level.
 func parsePermission(value interface{}) (Permission, error) {
+	var perm Permission
 	switch v := value.(type) {
 	case float64:
-		return Permission(int(v)), nil
+		perm = Permission(int(v))
 	case int:
-		return Permission(v), nil
+		perm = Permission(v)
 	case Permission:
-		return v, nil
+		perm = v
 	default:
 		return Revoked, fmt.Errorf("invalid permission format: expected number or Permission, got %T", value)
 	}
+
+	if !perm.isValid() {
+		return Revoked, fmt.Errorf("permission value out of range: %d", int(perm))
+	}
+	return perm, nil
 }

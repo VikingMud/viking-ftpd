@@ -67,12 +67,23 @@ func NewLineParser(line string) *LineParser {
 // The input should consist of key-value pairs, one per line.
 // Empty lines and lines starting with # are ignored.
 // Returns error if input is empty or invalid.
-func (p *ObjectParser) ParseObject(input string) (*ParseResult, error) {
+func (p *ObjectParser) ParseObject(input string) (result *ParseResult, err error) {
+	// Never let a malformed object crash the caller. This parser runs on
+	// machine-generated files (the access tree, character files) that can be
+	// read mid-write; a panic here would otherwise take down the daemon, since
+	// the SFTP request server does not recover per-operation.
+	defer func() {
+		if r := recover(); r != nil {
+			result = nil
+			err = fmt.Errorf("panic while parsing object: %v", r)
+		}
+	}()
+
 	if len(input) == 0 {
 		return nil, fmt.Errorf("input string is empty")
 	}
 
-	result := &ParseResult{
+	result = &ParseResult{
 		Object: make(map[string]interface{}),
 		Errors: make([]*ParseError, 0),
 	}
@@ -527,6 +538,11 @@ func (p *LineParser) skipSpaces() {
 
 // match checks if the next runes match the given string and advances the position if they do
 func (p *LineParser) match(s string) bool {
+	// Bounds check: a truncated value (e.g. a line ending in "n" while trying
+	// to match "nil") must not slice past the end of the input and panic.
+	if p.pos+len(s) > len(p.s) {
+		return false
+	}
 	if p.s[p.pos:p.pos+len(s)] == s {
 		p.pos += len(s)
 		return true
