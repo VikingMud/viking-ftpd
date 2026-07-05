@@ -1,6 +1,7 @@
 package lpc
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -119,7 +120,126 @@ another bad line`,
 	})
 }
 
-// Line Parsing Tests
+// TestParseErrorReporting checks that a strict-mode failure returns a
+// *ParseError located to the right line and column, and that its message
+// includes both. This is the error contract callers rely on.
+func TestParseErrorReporting(t *testing.T) {
+	// Line 2 has an invalid value; the bad character '!' is at column 5
+	// ("bad " is four bytes, so the value starts at 0-based pos 4).
+	input := "good \"ok\"\nbad !value"
+
+	_, err := NewObjectParser(true).ParseObject(input)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+
+	var pe *ParseError
+	if !errors.As(err, &pe) {
+		t.Fatalf("expected *ParseError, got %T: %v", err, err)
+	}
+	if pe.Line != 2 {
+		t.Errorf("Line = %d, want 2", pe.Line)
+	}
+	if pe.Column != 5 {
+		t.Errorf("Column = %d, want 5", pe.Column)
+	}
+	if msg := pe.Error(); !strings.Contains(msg, "line 2, column 5") {
+		t.Errorf("Error() = %q, want it to mention line 2, column 5", msg)
+	}
+}
+
+// TestNonStrictCollectsErrorsAndSkips confirms non-strict mode keeps the good
+// entries and records the bad lines rather than aborting.
+func TestNonStrictCollectsErrorsAndSkips(t *testing.T) {
+	input := "a 1\nbad !x\nb 2\nalso @bad\nc 3"
+
+	res, err := NewObjectParser(false).ParseObject(input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(res.Object) != 3 {
+		t.Errorf("kept %d entries, want 3 (a, b, c)", len(res.Object))
+	}
+	if len(res.Errors) != 2 {
+		t.Errorf("collected %d errors, want 2", len(res.Errors))
+	}
+	for _, want := range []string{"a", "b", "c"} {
+		if _, ok := res.Object[want]; !ok {
+			t.Errorf("missing key %q", want)
+		}
+	}
+}
+
+// TestAllInvalidReturnsError confirms that an input with no parseable entries
+// is an error with a nil result (result-xor-error contract).
+func TestAllInvalidReturnsError(t *testing.T) {
+	res, err := NewObjectParser(false).ParseObject("!bad\n@worse")
+	if err == nil {
+		t.Fatal("expected an error for wholly invalid input")
+	}
+	if res != nil {
+		t.Errorf("expected nil result on error, got %+v", res)
+	}
+}
+
+// TestParseObjectNoPanicOnTruncatedInput covers malformed/truncated objects
+// that must produce a parse error rather than crashing. The "nil" cases in
+// particular previously panicked in match() by slicing past the end of the
+// line while trying to match the literal "nil".
+func TestParseObjectNoPanicOnTruncatedInput(t *testing.T) {
+	inputs := []string{
+		"x n",                    // value truncated to "n"
+		"x ni",                   // value truncated to "ni"
+		"n",                      // no key/value, starts with n
+		"m ([1|\"a\":n",          // truncated nil inside a mapping
+		"a ({1|n",                // truncated nil inside an array
+		"m ([2|\"a\":1,\"b\":ni", // truncated nil as a later map value
+		"x (",                    // truncated container
+		"x ({",                   // truncated array open
+		"x ([",                   // truncated map open
+		"x \"unterminated",       // unterminated string
+		"m ([1|\"k\":({2|1,2",    // truncated nested array
+	}
+	for _, in := range inputs {
+		t.Run(in, func(t *testing.T) {
+			// The assertion is simply that neither parser mode panics; a panic
+			// here would fail the subtest.
+			_, _ = NewObjectParser(false).ParseObject(in)
+			_, _ = NewObjectParser(true).ParseObject(in)
+		})
+	}
+}
+
+// TestCRLFLineHandling documents behavior on Windows line endings: the trailing
+// '\r' becomes part of the line and makes the value invalid, but it must fail
+// gracefully rather than panic or silently accept.
+func TestCRLFLineHandling(t *testing.T) {
+	// "a 1" is clean; "b 2\r" keeps a trailing carriage return that makes the
+	// value invalid. CRLF input should fail gracefully per line, not panic.
+	res, err := NewObjectParser(false).ParseObject("a 1\nb 2\r")
+	if err != nil {
+		t.Fatalf("unexpected top-level error: %v", err)
+	}
+	if _, ok := res.Object["a"]; !ok || len(res.Object) != 1 {
+		t.Errorf("expected only {a:1}, got %v", res.Object)
+	}
+	if len(res.Errors) != 1 {
+		t.Errorf("expected 1 error for the CRLF line, got %d", len(res.Errors))
+	}
+}
+
+// TestParseObjectValidNilStillWorks guards against the bounds fix breaking the
+// normal nil path.
+func TestParseObjectValidNilStillWorks(t *testing.T) {
+	res, err := NewObjectParser(true).ParseObject("value nil")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	v, ok := res.Object["value"]
+	if !ok || v != nil {
+		t.Fatalf("expected value=nil, got %#v (present=%v)", v, ok)
+	}
+}
 
 func TestLineParsing(t *testing.T) {
 	t.Run("Basic Line Format", func(t *testing.T) {
@@ -227,8 +347,8 @@ func TestLineParsing(t *testing.T) {
 				if tt.setup != nil {
 					tt.setup(t)
 				}
-				lp := NewLineParser(tt.line)
-				key, val, err := lp.ParseLine()
+				lp := newLineParser(tt.line)
+				key, val, err := lp.parseLine()
 				if (err != nil) != tt.wantErr {
 					t.Errorf("ParseLine() error = %v, wantErr %v", err, tt.wantErr)
 					return
@@ -246,8 +366,6 @@ func TestLineParsing(t *testing.T) {
 	})
 
 }
-
-// Value Parsing Tests
 
 func TestValueParsing(t *testing.T) {
 	t.Run("Strings", func(t *testing.T) {
@@ -351,7 +469,7 @@ func TestValueParsing(t *testing.T) {
 
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
-				lp := NewLineParser(tt.input)
+				lp := newLineParser(tt.input)
 				got, err := lp.parseString()
 				if (err != nil) != tt.wantErr {
 					t.Errorf("parseString() error = %v, wantErr %v", err, tt.wantErr)
@@ -423,7 +541,7 @@ func TestValueParsing(t *testing.T) {
 
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
-				lp := NewLineParser(tt.input)
+				lp := newLineParser(tt.input)
 				got, err := lp.parseNumber()
 				t.Logf("parseNumber() returned value: %v, error: %v", got, err)
 				if (err != nil) != tt.wantErr {
@@ -468,7 +586,7 @@ func TestValueParsing(t *testing.T) {
 
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
-				lp := NewLineParser(tt.input)
+				lp := newLineParser(tt.input)
 				got, err := lp.parseValue()
 				if (err != nil) != tt.wantErr {
 					t.Errorf("parseValue() error = %v, wantErr %v", err, tt.wantErr)
@@ -555,7 +673,7 @@ func TestValueParsing(t *testing.T) {
 
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
-				lp := NewLineParser(tt.input)
+				lp := newLineParser(tt.input)
 				got, err := lp.parseArray()
 				if (err != nil) != tt.wantErr {
 					t.Errorf("parseArray() error = %v, wantErr %v", err, tt.wantErr)
@@ -644,7 +762,7 @@ func TestValueParsing(t *testing.T) {
 
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
-				lp := NewLineParser(tt.input)
+				lp := newLineParser(tt.input)
 				got, err := lp.parseMap()
 				if (err != nil) != tt.wantErr {
 					t.Errorf("parseMap() error = %v, wantErr %v", err, tt.wantErr)
@@ -698,7 +816,7 @@ func TestValueParsing(t *testing.T) {
 
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
-				p := NewLineParser(tt.input)
+				p := newLineParser(tt.input)
 				got, err := p.parseValue()
 				if (err != nil) != tt.wantErr {
 					t.Errorf("parseValue() error = %v, wantErr %v", err, tt.wantErr)
@@ -710,6 +828,61 @@ func TestValueParsing(t *testing.T) {
 			})
 		}
 	})
+}
+
+// TestIntegerOverflow makes sure an out-of-range integer is a graceful error,
+// not a panic.
+func TestIntegerOverflow(t *testing.T) {
+	res, err := NewObjectParser(false).ParseObject("ok 1\nn 999999999999999999999999999999")
+	if err != nil {
+		t.Fatalf("unexpected top-level error: %v", err)
+	}
+	if len(res.Errors) != 1 {
+		t.Fatalf("expected 1 collected error, got %d", len(res.Errors))
+	}
+	if _, ok := res.Object["n"]; ok {
+		t.Error("overflowing integer should not have been stored")
+	}
+}
+
+// TestComplexKeysSkipped confirms the whole-object path where a mapping has an
+// array/map key: the entry is dropped but still counted toward the size.
+func TestComplexKeysSkipped(t *testing.T) {
+	// size 2: one array-keyed entry (skipped) and one normal entry (kept).
+	res, err := NewObjectParser(true).ParseObject(`m ([2|({1|1}):5,"keep":7])`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	m, ok := res.Object["m"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("m is not a map: %T", res.Object["m"])
+	}
+	if len(m) != 1 || m["keep"] != 7 {
+		t.Errorf("map = %v, want only {keep:7}", m)
+	}
+}
+
+// TestDeeplyNested exercises recursion depth without a stack helper.
+func TestDeeplyNested(t *testing.T) {
+	const depth = 200
+	in := "x " + strings.Repeat("({1|", depth) + "1" + strings.Repeat("})", depth)
+
+	res, err := NewObjectParser(true).ParseObject(in)
+	if err != nil {
+		t.Fatalf("unexpected error at depth %d: %v", depth, err)
+	}
+	// Walk back down and confirm the innermost value survived.
+	cur := res.Object["x"]
+	for i := 0; i < depth; i++ {
+		arr, ok := cur.([]interface{})
+		if !ok || len(arr) != 1 {
+			t.Fatalf("level %d is not a 1-element array: %T", i, cur)
+		}
+		cur = arr[0]
+	}
+	if cur != 1 {
+		t.Errorf("innermost value = %v, want 1", cur)
+	}
 }
 
 // Real World File Parsing Tests
