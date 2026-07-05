@@ -40,11 +40,11 @@ type Config struct {
 	AccessCacheTime    int `json:"access_cache_time"`    // How long to cache access data (seconds)
 
 	// Logging settings
-	AccessLogPath     string `json:"access_log_path"`      // Path to access log file
-	AppLogPath        string `json:"app_log_path"`         // Path to application log file
-	LogLevel          string `json:"log_level"`            // Log level (debug, info, warn, error, panic)
-	MaxLogSize        int    `json:"max_log_size"`         // Maximum log size in bytes before rotation
-	LogVerifyInterval int    `json:"log_verify_interval"`  // Seconds between file verification checks
+	AccessLogPath     string `json:"access_log_path"`     // Path to access log file
+	AppLogPath        string `json:"app_log_path"`        // Path to application log file
+	LogLevel          string `json:"log_level"`           // Log level (debug, info, warn, error, panic)
+	MaxLogSize        int    `json:"max_log_size"`        // Maximum log size in bytes before rotation
+	LogVerifyInterval int    `json:"log_verify_interval"` // Seconds between file verification checks
 
 	// Status monitoring (optional)
 	StatusDir string `json:"status_dir"` // Directory for status files (last_start, running, last_stop)
@@ -141,6 +141,10 @@ func LoadConfig(path string, config *Config) error {
 	}
 	if config.IdleTimeout < 0 {
 		return fmt.Errorf("idle_timeout must not be negative, got %d", config.IdleTimeout)
+	}
+	if config.PasvPortRange[0] < 1 || config.PasvPortRange[1] > 65535 || config.PasvPortRange[0] > config.PasvPortRange[1] {
+		return fmt.Errorf("pasv_port_range must be an ascending range within 1-65535, got [%d, %d]",
+			config.PasvPortRange[0], config.PasvPortRange[1])
 	}
 
 	return nil

@@ -101,6 +101,11 @@ func Shutdown() {
 // formatValue formats a value for logfmt, quoting if necessary
 func formatValue(v interface{}) string {
 	s := fmt.Sprintf("%v", v)
+	// Neutralize control characters so a crafted username or path cannot forge
+	// or split access-log lines (consistent with the app logger's handling).
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.ReplaceAll(s, "\t", " ")
 	// Quote if contains space, equals, or quotes
 	if strings.ContainsAny(s, " =\"") {
 		// Escape existing quotes
