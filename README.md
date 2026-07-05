@@ -117,8 +117,10 @@ When logs exceed `max_log_size`, they are automatically rotated to timestamped a
 | `authorization` | Implements permission checking by parsing the MUD's `access.o` object tree. Validates user access rights against the MUD's [hierarchical permission system](docs/viking_access_tree.md). The access tree is cached to reduce filesystem reads. |
 | `ftpserver` | Core FTP server implementation built on [ftpserverlib](https://github.com/fclairamb/ftpserverlib). Handles FTP protocol operations while integrating with MUD-specific authentication and authorization. |
 | `sftpserver` | SFTP server built on [pkg/sftp](https://github.com/pkg/sftp) and `golang.org/x/crypto/ssh`. Serves only the SFTP subsystem (no shell/exec) with the same authentication, authorization, jail, and access logging as the FTP server. |
+| `vfs` | Shared authorized filesystem used by both the FTP and SFTP servers. Owns the per-path permission checks, the jail under `ftp_root_dir`, upload permission clamping, and the access-log vocabulary, so both protocols enforce one policy. |
 | `lpc` | Parses [LPC (Lars Pensjo C) serialized object format](https://github.com/mmcdole/viking-ftpd/blob/main/docs/lpc_object_format.md) used by LPMuds. Enables direct reading of MUD's data structures like the access control tree. |
 | `users` | Manages user data by reading and caching the MUD's character files.  |
+| `status` | Writes health status files (`last_start`, `running`, `last_stop`) with live connection metrics, so the MUD can detect a crashed daemon. |
 
 ## License
 
