@@ -7,17 +7,17 @@ import (
 	"io"
 	"net"
 	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/pkg/sftp"
-	"github.com/spf13/afero"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/mmcdole/viking-ftpd/pkg/logging"
+	"github.com/mmcdole/viking-ftpd/pkg/status"
 	"github.com/mmcdole/viking-ftpd/pkg/users"
+	"github.com/mmcdole/viking-ftpd/pkg/vfs"
 )
 
 // handshakeTimeout bounds how long a client may take to complete the SSH
@@ -29,13 +29,6 @@ const handshakeTimeout = 30 * time.Second
 // *authentication.Authenticator.
 type Authenticator interface {
 	Authenticate(username, password string) (*users.User, error)
-}
-
-// Authorizer answers per-path permission checks. Satisfied by
-// *authorization.Authorizer.
-type Authorizer interface {
-	CanRead(username, path string) bool
-	CanWrite(username, path string) bool
 }
 
 // Config holds the server configuration
@@ -54,7 +47,7 @@ type Config struct {
 type Server struct {
 	config        *Config
 	authenticator Authenticator
-	authorizer    Authorizer
+	authorizer    vfs.Authorizer
 	sshConfig     *ssh.ServerConfig
 	version       string
 
@@ -64,15 +57,13 @@ type Server struct {
 	stopping bool
 	wg       sync.WaitGroup
 
-	activeConnections atomic.Int32
-	totalConnections  atomic.Int64
-	startTime         time.Time
+	status.ConnMetrics
 }
 
 // New creates a new SFTP server. The host key is loaded (or generated)
 // eagerly so that a bad key configuration fails at startup rather than on
 // first connection.
-func New(config *Config, authorizer Authorizer, authenticator Authenticator, version string) (*Server, error) {
+func New(config *Config, authorizer vfs.Authorizer, authenticator Authenticator, version string) (*Server, error) {
 	if _, err := os.Stat(config.RootDir); err != nil {
 		return nil, fmt.Errorf("root directory does not exist: %w", err)
 	}
@@ -91,8 +82,8 @@ func New(config *Config, authorizer Authorizer, authenticator Authenticator, ver
 		authorizer:    authorizer,
 		version:       version,
 		conns:         make(map[net.Conn]struct{}),
-		startTime:     time.Now(),
 	}
+	s.SetStartTime(time.Now())
 
 	// Only password auth is offered; with no PublicKeyCallback the publickey
 	// method is never advertised to clients.
@@ -225,20 +216,8 @@ func (s *Server) Addr() net.Addr {
 	return s.listener.Addr()
 }
 
-// GetActiveConnections returns the current number of active connections
-func (s *Server) GetActiveConnections() int32 {
-	return s.activeConnections.Load()
-}
-
-// GetTotalConnections returns the total number of connections since server start
-func (s *Server) GetTotalConnections() int64 {
-	return s.totalConnections.Load()
-}
-
-// GetStartTime returns the server start time
-func (s *Server) GetStartTime() time.Time {
-	return s.startTime
-}
+// Connection metrics (GetActiveConnections, GetTotalConnections,
+// GetStartTime) are promoted from the embedded status.ConnMetrics.
 
 // untrackConn removes conn from the tracked set and closes it.
 func (s *Server) untrackConn(conn net.Conn) {
@@ -255,14 +234,14 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	// Atomic increment-then-check so concurrent dials can't both slip past a
 	// load-then-add limit check.
-	n := s.activeConnections.Add(1)
-	defer s.activeConnections.Add(-1)
+	n := s.IncActive()
+	defer s.DecActive()
 	if s.config.MaxConnections > 0 && n > int32(s.config.MaxConnections) {
 		logging.App.Warn("Refusing SFTP connection: connection limit reached", "client_ip", remoteAddr, "max_connections", s.config.MaxConnections)
 		return
 	}
 
-	s.totalConnections.Add(1)
+	s.IncTotal()
 	logging.Access.LogAccess("connect", "", remoteAddr, "success", "protocol", "sftp")
 	defer logging.Access.LogAccess("disconnect", "", remoteAddr, "success", "protocol", "sftp")
 
@@ -341,17 +320,10 @@ func subsystemName(payload []byte) string {
 // serveSFTP runs an SFTP request server over the channel, jailed to RootDir
 // and starting in the user's home directory (mirroring the FTP driver).
 func (s *Server) serveSFTP(user string, channel ssh.Channel) {
-	fs := afero.NewBasePathFs(afero.NewOsFs(), s.config.RootDir)
+	home := vfs.ResolveHome(s.config.RootDir, s.config.HomePattern, user)
+	fs := vfs.New(s.config.RootDir, user, s.authorizer, "sftp")
 
-	home := "/"
-	if s.config.HomePattern != "" {
-		homePath := filepath.Clean(fmt.Sprintf(s.config.HomePattern, user))
-		if info, err := fs.Stat(homePath); err == nil && info.IsDir() {
-			home = filepath.Join("/", homePath)
-		}
-	}
-
-	server := sftp.NewRequestServer(channel, newHandlers(s, user, fs), sftp.WithStartDirectory(home))
+	server := sftp.NewRequestServer(channel, newHandlers(fs), sftp.WithStartDirectory(home))
 	if err := server.Serve(); err != nil && !errors.Is(err, io.EOF) {
 		logging.App.Debug("SFTP session ended", "user", user, "error", err)
 	}

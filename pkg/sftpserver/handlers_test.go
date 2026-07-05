@@ -8,20 +8,12 @@ import (
 	"time"
 
 	"github.com/pkg/sftp"
-	"github.com/spf13/afero"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/mmcdole/viking-ftpd/pkg/authorization"
 	"github.com/mmcdole/viking-ftpd/pkg/users"
-)
-
-// SFTP open flag wire values (draft-ietf-secsh-filexfer)
-const (
-	flagRead  = 0x1
-	flagWrite = 0x2
-	flagCreat = 0x8
-	flagTrunc = 0x10
+	"github.com/mmcdole/viking-ftpd/pkg/vfs"
 )
 
 type stubAccessSource struct {
@@ -34,6 +26,7 @@ func (s *stubAccessSource) LoadAccessData() (map[string]interface{}, error) {
 
 // testTree gives everyone Read everywhere except /private, which is revoked.
 // Write access comes only from the implicit GrantGrant on players/<self>.
+// (Shared with integration_test.go.)
 func testTree() map[string]interface{} {
 	return map[string]interface{}{
 		"access_map": map[string]interface{}{
@@ -46,8 +39,10 @@ func testTree() map[string]interface{} {
 	}
 }
 
-// newTestHandlers builds handlers for user "alice" over a real temp dir
-// containing /hello.txt, /private/secret.txt, and /players/alice/note.txt.
+// newTestHandlers builds handlers backed by a real vfs.FS for user "alice" over
+// a temp dir with /hello.txt, /private/secret.txt, and /players/alice/note.txt.
+// Per-operation authorization is covered exhaustively in pkg/vfs; these tests
+// focus on the SFTP protocol-translation layer.
 func newTestHandlers(t *testing.T) (*sftpHandlers, string) {
 	t.Helper()
 	root := t.TempDir()
@@ -62,200 +57,7 @@ func newTestHandlers(t *testing.T) (*sftpHandlers, string) {
 	charSource.AddUser(&users.User{Username: "alice", Level: users.WIZARD})
 	authorizer := authorization.NewAuthorizer(&stubAccessSource{testTree()}, charSource, time.Minute)
 
-	server := &Server{
-		config:     &Config{RootDir: root},
-		authorizer: authorizer,
-	}
-	fs := afero.NewBasePathFs(afero.NewOsFs(), root)
-	return &sftpHandlers{server: server, user: "alice", fs: fs}, root
-}
-
-func TestFileread(t *testing.T) {
-	h, _ := newTestHandlers(t)
-
-	t.Run("allowed", func(t *testing.T) {
-		reader, err := h.Fileread(sftp.NewRequest("Get", "/hello.txt"))
-		require.NoError(t, err)
-		defer reader.(io.Closer).Close()
-
-		buf := make([]byte, 11)
-		n, err := reader.ReadAt(buf, 0)
-		require.NoError(t, err)
-		assert.Equal(t, "hello world", string(buf[:n]))
-	})
-
-	t.Run("denied", func(t *testing.T) {
-		_, err := h.Fileread(sftp.NewRequest("Get", "/private/secret.txt"))
-		assert.ErrorIs(t, err, sftp.ErrSSHFxPermissionDenied)
-	})
-}
-
-func TestFilewrite(t *testing.T) {
-	h, root := newTestHandlers(t)
-
-	t.Run("allowed in home", func(t *testing.T) {
-		req := sftp.NewRequest("Put", "/players/alice/new.txt")
-		req.Flags = flagWrite | flagCreat | flagTrunc
-
-		writer, err := h.Filewrite(req)
-		require.NoError(t, err)
-
-		_, err = writer.WriteAt([]byte("uploaded"), 0)
-		require.NoError(t, err)
-		require.NoError(t, writer.(io.Closer).Close())
-
-		data, err := os.ReadFile(filepath.Join(root, "players", "alice", "new.txt"))
-		require.NoError(t, err)
-		assert.Equal(t, "uploaded", string(data))
-	})
-
-	t.Run("denied outside home", func(t *testing.T) {
-		req := sftp.NewRequest("Put", "/denied.txt")
-		req.Flags = flagWrite | flagCreat | flagTrunc
-
-		_, err := h.Filewrite(req)
-		assert.ErrorIs(t, err, sftp.ErrSSHFxPermissionDenied)
-		assert.NoFileExists(t, filepath.Join(root, "denied.txt"))
-	})
-}
-
-func TestOpenFileReadWrite(t *testing.T) {
-	h, _ := newTestHandlers(t)
-
-	req := sftp.NewRequest("Open", "/players/alice/note.txt")
-	req.Flags = flagRead | flagWrite
-
-	file, err := h.OpenFile(req)
-	require.NoError(t, err)
-	defer file.(io.Closer).Close()
-
-	_, err = file.WriteAt([]byte("NOTE"), 0)
-	require.NoError(t, err)
-
-	buf := make([]byte, 4)
-	_, err = file.ReadAt(buf, 0)
-	require.NoError(t, err)
-	assert.Equal(t, "NOTE", string(buf))
-}
-
-func TestFilecmdMkdirRemove(t *testing.T) {
-	h, root := newTestHandlers(t)
-
-	t.Run("mkdir allowed in home", func(t *testing.T) {
-		err := h.Filecmd(sftp.NewRequest("Mkdir", "/players/alice/subdir"))
-		require.NoError(t, err)
-		assert.DirExists(t, filepath.Join(root, "players", "alice", "subdir"))
-	})
-
-	t.Run("mkdir denied outside home", func(t *testing.T) {
-		err := h.Filecmd(sftp.NewRequest("Mkdir", "/newdir"))
-		assert.ErrorIs(t, err, sftp.ErrSSHFxPermissionDenied)
-	})
-
-	t.Run("remove allowed in home", func(t *testing.T) {
-		err := h.Filecmd(sftp.NewRequest("Remove", "/players/alice/note.txt"))
-		require.NoError(t, err)
-		assert.NoFileExists(t, filepath.Join(root, "players", "alice", "note.txt"))
-	})
-
-	t.Run("remove denied on read-only path", func(t *testing.T) {
-		err := h.Filecmd(sftp.NewRequest("Remove", "/hello.txt"))
-		assert.ErrorIs(t, err, sftp.ErrSSHFxPermissionDenied)
-		assert.FileExists(t, filepath.Join(root, "hello.txt"))
-	})
-}
-
-func TestFilecmdRename(t *testing.T) {
-	h, root := newTestHandlers(t)
-
-	t.Run("allowed when both paths writable", func(t *testing.T) {
-		req := sftp.NewRequest("Rename", "/players/alice/note.txt")
-		req.Target = "/players/alice/renamed.txt"
-
-		require.NoError(t, h.Filecmd(req))
-		assert.FileExists(t, filepath.Join(root, "players", "alice", "renamed.txt"))
-	})
-
-	t.Run("denied when target not writable", func(t *testing.T) {
-		req := sftp.NewRequest("Rename", "/players/alice/renamed.txt")
-		req.Target = "/escaped.txt"
-
-		assert.ErrorIs(t, h.Filecmd(req), sftp.ErrSSHFxPermissionDenied)
-	})
-
-	t.Run("denied when source not writable", func(t *testing.T) {
-		req := sftp.NewRequest("Rename", "/hello.txt")
-		req.Target = "/players/alice/stolen.txt"
-
-		assert.ErrorIs(t, h.Filecmd(req), sftp.ErrSSHFxPermissionDenied)
-	})
-}
-
-func TestFilecmdLinksUnsupported(t *testing.T) {
-	h, _ := newTestHandlers(t)
-
-	for _, method := range []string{"Symlink", "Link"} {
-		req := sftp.NewRequest(method, "/players/alice/target")
-		req.Target = "/players/alice/link"
-		assert.ErrorIs(t, h.Filecmd(req), sftp.ErrSSHFxOpUnsupported, method)
-	}
-}
-
-func TestFilecmdSetstat(t *testing.T) {
-	h, _ := newTestHandlers(t)
-
-	t.Run("denied outside home", func(t *testing.T) {
-		err := h.Filecmd(sftp.NewRequest("Setstat", "/hello.txt"))
-		assert.ErrorIs(t, err, sftp.ErrSSHFxPermissionDenied)
-	})
-
-	t.Run("allowed in home with no attributes", func(t *testing.T) {
-		err := h.Filecmd(sftp.NewRequest("Setstat", "/players/alice/note.txt"))
-		assert.NoError(t, err)
-	})
-}
-
-func TestFilelist(t *testing.T) {
-	h, _ := newTestHandlers(t)
-
-	t.Run("list allowed and sorted", func(t *testing.T) {
-		lister, err := h.Filelist(sftp.NewRequest("List", "/"))
-		require.NoError(t, err)
-
-		entries := make([]os.FileInfo, 8)
-		n, listErr := lister.ListAt(entries, 0)
-		require.ErrorIs(t, listErr, io.EOF)
-		require.Equal(t, 3, n)
-		assert.Equal(t, "hello.txt", entries[0].Name())
-		assert.Equal(t, "players", entries[1].Name())
-		assert.Equal(t, "private", entries[2].Name())
-	})
-
-	t.Run("list denied", func(t *testing.T) {
-		_, err := h.Filelist(sftp.NewRequest("List", "/private"))
-		assert.ErrorIs(t, err, sftp.ErrSSHFxPermissionDenied)
-	})
-
-	t.Run("stat allowed", func(t *testing.T) {
-		lister, err := h.Filelist(sftp.NewRequest("Stat", "/hello.txt"))
-		require.NoError(t, err)
-
-		entries := make([]os.FileInfo, 1)
-		n, listErr := lister.ListAt(entries, 0)
-		require.True(t, listErr == nil || listErr == io.EOF)
-		require.Equal(t, 1, n)
-		assert.Equal(t, int64(11), entries[0].Size())
-	})
-
-	t.Run("stat denied", func(t *testing.T) {
-		_, err := h.Filelist(sftp.NewRequest("Stat", "/private/secret.txt"))
-		assert.ErrorIs(t, err, sftp.ErrSSHFxPermissionDenied)
-	})
-
-	t.Run("readlink unsupported", func(t *testing.T) {
-		_, err := h.Filelist(sftp.NewRequest("Readlink", "/hello.txt"))
-		assert.ErrorIs(t, err, sftp.ErrSSHFxOpUnsupported)
-	})
+	return &sftpHandlers{fs: vfs.New(root, "alice", authorizer, "sftp")}, root
 }
 
 func TestTranslateError(t *testing.T) {
@@ -269,13 +71,40 @@ func TestTranslateError(t *testing.T) {
 	assert.Equal(t, sftp.ErrSSHFxNoSuchFile, translateError(wrapped))
 }
 
-func TestErrorDoesNotLeakRealPath(t *testing.T) {
+// TestHandlerTranslatesDenial confirms an authorization denial from vfs becomes
+// the generic SFTP permission-denied status, not a raw error.
+func TestHandlerTranslatesDenial(t *testing.T) {
+	h, _ := newTestHandlers(t)
+
+	_, err := h.Fileread(sftp.NewRequest("Get", "/private/secret.txt"))
+	assert.Equal(t, sftp.ErrSSHFxPermissionDenied, err)
+}
+
+// TestHandlerErrorDoesNotLeakRealPath ensures the jail path never reaches the
+// client through a translated error.
+func TestHandlerErrorDoesNotLeakRealPath(t *testing.T) {
 	h, root := newTestHandlers(t)
 
 	_, err := h.Fileread(sftp.NewRequest("Get", "/players/alice/nonexistent.txt"))
 	require.Error(t, err)
-	assert.NotContains(t, err.Error(), root, "SFTP error must not expose the jail path")
+	assert.NotContains(t, err.Error(), root)
 	assert.Equal(t, sftp.ErrSSHFxNoSuchFile, err)
+}
+
+func TestFilecmdLinksUnsupported(t *testing.T) {
+	h, _ := newTestHandlers(t)
+
+	for _, method := range []string{"Symlink", "Link"} {
+		req := sftp.NewRequest(method, "/players/alice/target")
+		req.Target = "/players/alice/link"
+		assert.ErrorIs(t, h.Filecmd(req), sftp.ErrSSHFxOpUnsupported, method)
+	}
+}
+
+func TestFilelistReadlinkUnsupported(t *testing.T) {
+	h, _ := newTestHandlers(t)
+	_, err := h.Filelist(sftp.NewRequest("Readlink", "/hello.txt"))
+	assert.ErrorIs(t, err, sftp.ErrSSHFxOpUnsupported)
 }
 
 func TestToOsFileFlagsAppend(t *testing.T) {

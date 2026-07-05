@@ -122,7 +122,7 @@ Configuration file must be in JSON format with the following structure:
 			PasvPortRange:  config.PasvPortRange,
 			PasvAddress:    config.PasvAddress,
 			PasvIPVerify:   config.PasvIPVerify,
-			IdleTimeout:    config.IdleTimeout,
+			IdleTimeout:    time.Duration(config.IdleTimeout) * time.Second,
 			MaxConnections: config.MaxConnections,
 		}, authorizer, authenticator, version)
 		if err != nil {
