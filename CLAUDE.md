@@ -36,6 +36,8 @@ This is a specialized FTP server for VikingMUD that integrates with the MUD's au
 
 - **FTP Server** (`pkg/ftpserver/`): Core FTP protocol handling using [ftpserverlib](https://github.com/fclairamb/ftpserverlib). Implements the driver interface that integrates authentication and authorization checks into FTP operations. Supports both plain FTP and FTPS with optional TLS.
 
+- **SFTP Server** (`pkg/sftpserver/`): Optional SFTP endpoint (enabled via `sftp_port`) built on `github.com/pkg/sftp`'s request-server and `golang.org/x/crypto/ssh`. Reuses the same authenticator, authorizer, filesystem jail, home-directory logic, and access logging as the FTP server. Serves only the `sftp` subsystem — shell/exec/scp and link operations are refused. Password auth only; the ed25519 host key is auto-generated at `ssh_host_key_file` on first start and never silently regenerated. Depends on small locally-defined `Authenticator`/`Authorizer` interfaces rather than the concrete types.
+
 - **Authentication** (`pkg/authentication/`): Multi-hash password verification supporting both legacy Unix crypt (DES-based) and modern Argon2id (PHC format). Uses constant-time comparison and always performs hash verification even for non-existent users to prevent timing attacks and user enumeration. The `MultiVerifier` tries each hash algorithm in sequence.
 
 - **Authorization** (`pkg/authorization/`): Hierarchical permission system that parses the MUD's `access.o` file containing an LPC-serialized access control tree. Permissions flow down the directory tree with inheritance, unless explicitly revoked. Uses cached access trees with configurable TTL. Supports permissions: Revoked, Read, Write, Grant (implying all lower permissions).

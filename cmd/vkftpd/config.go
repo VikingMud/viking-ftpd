@@ -26,6 +26,11 @@ type Config struct {
 	TLSCertFile string `json:"tls_cert_file"` // Path to TLS certificate file
 	TLSKeyFile  string `json:"tls_key_file"`  // Path to TLS private key file
 
+	// SFTP settings (optional; SFTP is disabled unless sftp_port is set)
+	SFTPListenAddr string `json:"sftp_listen_addr"`  // Address for the SFTP listener (defaults to listen_addr)
+	SFTPPort       int    `json:"sftp_port"`         // Port for SFTP (0 = disabled)
+	SSHHostKeyFile string `json:"ssh_host_key_file"` // Path to SSH host key (auto-generated if missing)
+
 	// MUD-specific paths
 	CharacterDirPath string `json:"character_dir_path"` // Path to character files directory
 	AccessFilePath   string `json:"access_file_path"`   // Path to the MUD's access.o file
@@ -89,6 +94,18 @@ func LoadConfig(path string, config *Config) error {
 		config.TLSKeyFile = filepath.Join(configDir, config.TLSKeyFile)
 	}
 
+	// SFTP defaults (only when enabled via sftp_port)
+	if config.SFTPPort != 0 {
+		if config.SFTPListenAddr == "" {
+			config.SFTPListenAddr = config.ListenAddr
+		}
+		if config.SSHHostKeyFile == "" {
+			config.SSHHostKeyFile = filepath.Join(configDir, "vkftpd_host_key")
+		} else if !filepath.IsAbs(config.SSHHostKeyFile) {
+			config.SSHHostKeyFile = filepath.Join(configDir, config.SSHHostKeyFile)
+		}
+	}
+
 	// Set defaults for optional settings
 	if config.Port == 0 {
 		config.Port = 2121
@@ -116,6 +133,14 @@ func LoadConfig(path string, config *Config) error {
 	}
 	if config.LogVerifyInterval == 0 {
 		config.LogVerifyInterval = 45 // 45 seconds
+	}
+
+	// Validate ranges after defaults are applied
+	if config.SFTPPort != 0 && (config.SFTPPort < 1 || config.SFTPPort > 65535) {
+		return fmt.Errorf("sftp_port must be between 1 and 65535, got %d", config.SFTPPort)
+	}
+	if config.IdleTimeout < 0 {
+		return fmt.Errorf("idle_timeout must not be negative, got %d", config.IdleTimeout)
 	}
 
 	return nil
