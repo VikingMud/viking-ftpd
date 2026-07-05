@@ -45,6 +45,13 @@ func (a *Authorizer) ResolvePermission(username string, filepath string) Permiss
 		return Revoked
 	}
 
+	// Snapshot the tree map under the read lock. refreshCache replaces the
+	// map wholesale rather than mutating it, so the captured reference is a
+	// stable, immutable view even if a concurrent refresh swaps in a new map.
+	a.mu.RLock()
+	trees := a.trees
+	a.mu.RUnlock()
+
 	// Clean the path and split into parts
 	parts := strings.Split(path.Clean(filepath), "/")
 	if len(parts) > 0 && parts[0] == "" {
@@ -62,7 +69,7 @@ func (a *Authorizer) ResolvePermission(username string, filepath string) Permiss
 	}
 
 	// Check user's direct permissions
-	if tree, ok := a.trees[username]; ok {
+	if tree, ok := trees[username]; ok {
 		perm := a.resolveNodePermission(tree.Root, parts)
 		if perm != Revoked {
 			logging.App.Debug("Resolved direct permission", "user", username, "path", filepath, "permission", perm)
@@ -72,7 +79,7 @@ func (a *Authorizer) ResolvePermission(username string, filepath string) Permiss
 
 	// Check all group permissions (both explicit and implicit)
 	for _, group := range a.ResolveGroups(username) {
-		if tree, ok := a.trees[group]; ok {
+		if tree, ok := trees[group]; ok {
 			perm := a.resolveNodePermission(tree.Root, parts)
 			if perm != Revoked {
 				logging.App.Debug("Resolved group permission", "user", username, "group", group, "path", filepath, "permission", perm)
@@ -82,7 +89,7 @@ func (a *Authorizer) ResolvePermission(username string, filepath string) Permiss
 	}
 
 	// Finally check default permissions
-	if tree, ok := a.trees["*"]; ok {
+	if tree, ok := trees["*"]; ok {
 		perm := a.resolveNodePermission(tree.Root, parts)
 		logging.App.Debug("Using default permission", "user", username, "path", filepath, "permission", perm)
 		return perm
