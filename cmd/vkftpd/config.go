@@ -135,5 +135,13 @@ func LoadConfig(path string, config *Config) error {
 		config.LogVerifyInterval = 45 // 45 seconds
 	}
 
+	// Validate ranges after defaults are applied
+	if config.SFTPPort != 0 && (config.SFTPPort < 1 || config.SFTPPort > 65535) {
+		return fmt.Errorf("sftp_port must be between 1 and 65535, got %d", config.SFTPPort)
+	}
+	if config.IdleTimeout < 0 {
+		return fmt.Errorf("idle_timeout must not be negative, got %d", config.IdleTimeout)
+	}
+
 	return nil
 }

@@ -91,8 +91,9 @@ Notes:
 - If the host key file does not exist, an ed25519 key is generated on first start (mode 0600) and its fingerprint logged. An existing but corrupt or group/world-accessible key file is a startup error — the key is never silently regenerated, so clients never see an unexpected host key change.
 - Authentication is by MUD password only; SSH public-key auth is not offered.
 - Only the `sftp` subsystem is served. Shell, exec, and port-forwarding requests are refused, so `ssh` gives no shell and `scp` (which uses exec) does not work — use `sftp`/SFTP-capable clients.
-- SFTP operations appear in the access log with the same `op=`/`status=` vocabulary as FTP; connect, disconnect, and login lines carry an extra `protocol=sftp` field. SFTP has no `chdir` operation (directory changes are client-side in the protocol).
-- Symlink and hardlink creation, and readlink, are refused.
+- SFTP operations appear in the access log with the same `op=`/`status=` vocabulary as FTP (plus a `setstat` op for attribute changes); connect, disconnect, and login lines carry an extra `protocol=sftp` field. SFTP has no `chdir` operation (directory changes are client-side in the protocol).
+- Symlink and hardlink creation, and readlink, are refused. Client-requested ownership changes (chown) are accepted but ignored — there is no owner concept in the MUD's permission model.
+- `max_connections` is currently enforced for SFTP connections only; the FTP server does not yet apply it.
 
 ### Caching and Logging
 - `character_cache_time`: How long to cache character data in seconds (default: 60)

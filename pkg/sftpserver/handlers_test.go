@@ -258,6 +258,39 @@ func TestFilelist(t *testing.T) {
 	})
 }
 
+func TestTranslateError(t *testing.T) {
+	assert.Nil(t, translateError(nil))
+	assert.Equal(t, sftp.ErrSSHFxNoSuchFile, translateError(os.ErrNotExist))
+	assert.Equal(t, sftp.ErrSSHFxPermissionDenied, translateError(os.ErrPermission))
+	assert.Equal(t, sftp.ErrSSHFxFailure, translateError(io.ErrUnexpectedEOF))
+
+	// Wrapped os errors (what afero/os actually return) still map correctly.
+	wrapped := &os.PathError{Op: "open", Path: "/mud/lib/secret", Err: os.ErrNotExist}
+	assert.Equal(t, sftp.ErrSSHFxNoSuchFile, translateError(wrapped))
+}
+
+func TestErrorDoesNotLeakRealPath(t *testing.T) {
+	h, root := newTestHandlers(t)
+
+	_, err := h.Fileread(sftp.NewRequest("Get", "/players/alice/nonexistent.txt"))
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), root, "SFTP error must not expose the jail path")
+	assert.Equal(t, sftp.ErrSSHFxNoSuchFile, err)
+}
+
+func TestToOsFileFlagsAppend(t *testing.T) {
+	// Append without the Write bit must still open writable, not O_RDONLY.
+	got := toOsFileFlags(sftp.FileOpenFlags{Append: true})
+	assert.NotZero(t, got&os.O_WRONLY, "append open should be writable")
+	assert.Zero(t, got&os.O_APPEND, "O_APPEND must not be set (conflicts with WriteAt)")
+
+	got = toOsFileFlags(sftp.FileOpenFlags{Read: true, Append: true})
+	assert.NotZero(t, got&os.O_RDWR, "read+append should be O_RDWR")
+
+	// Plain read stays read-only.
+	assert.Equal(t, os.O_RDONLY, toOsFileFlags(sftp.FileOpenFlags{Read: true}))
+}
+
 func TestListerAt(t *testing.T) {
 	infos := make([]os.FileInfo, 3)
 	l := listerAt(infos)

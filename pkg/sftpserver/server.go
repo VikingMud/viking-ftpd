@@ -60,7 +60,7 @@ type Server struct {
 
 	mu       sync.Mutex
 	listener net.Listener
-	conns    map[*ssh.ServerConn]struct{}
+	conns    map[net.Conn]struct{} // raw connections, tracked from accept time
 	stopping bool
 	wg       sync.WaitGroup
 
@@ -90,7 +90,7 @@ func New(config *Config, authorizer Authorizer, authenticator Authenticator, ver
 		authenticator: authenticator,
 		authorizer:    authorizer,
 		version:       version,
-		conns:         make(map[*ssh.ServerConn]struct{}),
+		conns:         make(map[net.Conn]struct{}),
 		startTime:     time.Now(),
 	}
 
@@ -144,6 +144,7 @@ func (s *Server) ListenAndServe() error {
 
 	logging.App.Info("SFTP server listening", "addr", listener.Addr().String())
 
+	var tempDelay time.Duration // backoff for transient accept errors
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -153,21 +154,51 @@ func (s *Server) ListenAndServe() error {
 			if stopping {
 				return nil
 			}
+			// Transient errors (e.g. fd exhaustion) must not take the whole
+			// daemon down; back off and retry, like net/http.Server.Serve.
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Temporary() {
+				if tempDelay == 0 {
+					tempDelay = 5 * time.Millisecond
+				} else {
+					tempDelay *= 2
+				}
+				if tempDelay > time.Second {
+					tempDelay = time.Second
+				}
+				logging.App.Warn("SFTP accept error, retrying", "error", err, "delay", tempDelay)
+				time.Sleep(tempDelay)
+				continue
+			}
 			return fmt.Errorf("accepting connection: %w", err)
 		}
+		tempDelay = 0
 
+		// Register the raw connection before spawning, under the same lock
+		// Stop uses, so a connection accepted concurrently with Stop is either
+		// tracked (and closed by Stop) or refused here — never orphaned.
+		s.mu.Lock()
+		if s.stopping {
+			s.mu.Unlock()
+			conn.Close()
+			return nil
+		}
+		s.conns[conn] = struct{}{}
 		s.wg.Add(1)
+		s.mu.Unlock()
+
 		go s.handleConn(conn)
 	}
 }
 
 // Stop closes the listener and all active connections, then waits for
-// connection goroutines to finish.
+// connection and session goroutines to finish. Closing the raw connection
+// unblocks clients stuck mid-handshake as well as established sessions.
 func (s *Server) Stop() error {
 	s.mu.Lock()
 	s.stopping = true
 	listener := s.listener
-	conns := make([]*ssh.ServerConn, 0, len(s.conns))
+	conns := make([]net.Conn, 0, len(s.conns))
 	for c := range s.conns {
 		conns = append(conns, c)
 	}
@@ -209,33 +240,31 @@ func (s *Server) GetStartTime() time.Time {
 	return s.startTime
 }
 
-func (s *Server) trackConn(conn *ssh.ServerConn, add bool) {
+// untrackConn removes conn from the tracked set and closes it.
+func (s *Server) untrackConn(conn net.Conn) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if add {
-		s.conns[conn] = struct{}{}
-	} else {
-		delete(s.conns, conn)
-	}
+	delete(s.conns, conn)
+	s.mu.Unlock()
+	conn.Close()
 }
 
 func (s *Server) handleConn(conn net.Conn) {
 	defer s.wg.Done()
+	defer s.untrackConn(conn)
 	remoteAddr := conn.RemoteAddr().String()
 
-	if s.config.MaxConnections > 0 && s.activeConnections.Load() >= int32(s.config.MaxConnections) {
+	// Atomic increment-then-check so concurrent dials can't both slip past a
+	// load-then-add limit check.
+	n := s.activeConnections.Add(1)
+	defer s.activeConnections.Add(-1)
+	if s.config.MaxConnections > 0 && n > int32(s.config.MaxConnections) {
 		logging.App.Warn("Refusing SFTP connection: connection limit reached", "client_ip", remoteAddr, "max_connections", s.config.MaxConnections)
-		conn.Close()
 		return
 	}
 
-	s.activeConnections.Add(1)
 	s.totalConnections.Add(1)
 	logging.Access.LogAccess("connect", "", remoteAddr, "success", "protocol", "sftp")
-	defer func() {
-		s.activeConnections.Add(-1)
-		logging.Access.LogAccess("disconnect", "", remoteAddr, "success", "protocol", "sftp")
-	}()
+	defer logging.Access.LogAccess("disconnect", "", remoteAddr, "success", "protocol", "sftp")
 
 	tconn := &timeoutConn{Conn: conn, idle: s.config.IdleTimeout}
 	conn.SetDeadline(time.Now().Add(handshakeTimeout))
@@ -243,13 +272,9 @@ func (s *Server) handleConn(conn net.Conn) {
 	sconn, chans, reqs, err := ssh.NewServerConn(tconn, s.sshConfig)
 	if err != nil {
 		// Failed handshakes/auth are already logged by the auth callback
-		conn.Close()
 		return
 	}
 	tconn.activate()
-
-	s.trackConn(sconn, true)
-	defer s.trackConn(sconn, false)
 	defer sconn.Close()
 
 	go ssh.DiscardRequests(reqs)
@@ -269,7 +294,13 @@ func (s *Server) handleChannels(sconn *ssh.ServerConn, chans <-chan ssh.NewChann
 		if err != nil {
 			continue
 		}
-		go s.handleSession(sconn.User(), channel, requests)
+		// Track session goroutines so Stop waits for in-flight transfers and
+		// their log lines to drain, not just the connection goroutine.
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.handleSession(sconn.User(), channel, requests)
+		}()
 	}
 }
 

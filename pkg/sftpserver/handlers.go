@@ -1,6 +1,7 @@
 package sftpserver
 
 import (
+	"errors"
 	"io"
 	"os"
 	"sort"
@@ -11,6 +12,23 @@ import (
 
 	"github.com/mmcdole/viking-ftpd/pkg/logging"
 )
+
+// translateError maps a filesystem error to a generic SFTP status error.
+// pkg/sftp sends the raw error text to the client, and afero's BasePathFs does
+// not strip the real jail path from its errors, so returning fs errors
+// verbatim would leak ftp_root_dir. The real error is logged at the call site.
+func translateError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, os.ErrNotExist):
+		return sftp.ErrSSHFxNoSuchFile
+	case errors.Is(err, os.ErrPermission):
+		return sftp.ErrSSHFxPermissionDenied
+	default:
+		return sftp.ErrSSHFxFailure
+	}
+}
 
 // sftpHandlers implements sftp.Handlers (FileReader, FileWriter, FileCmder,
 // FileLister). The request server hands every operation an absolute virtual
@@ -40,7 +58,7 @@ func (h *sftpHandlers) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	file, err := h.fs.Open(path)
 	if err != nil {
 		logging.Access.LogAccess("open", h.user, path, "error", "error", err)
-		return nil, err
+		return nil, translateError(err)
 	}
 
 	if fi, err := file.Stat(); err == nil {
@@ -88,7 +106,7 @@ func (h *sftpHandlers) openForWrite(r *sftp.Request) (afero.File, error) {
 	file, err := h.fs.OpenFile(path, toOsFileFlags(flags), 0644)
 	if err != nil {
 		logging.Access.LogAccess(op, h.user, path, "error", "error", err)
-		return nil, err
+		return nil, translateError(err)
 	}
 
 	logging.Access.LogAccess(op, h.user, path, "success", "mode", "write")
@@ -97,13 +115,15 @@ func (h *sftpHandlers) openForWrite(r *sftp.Request) (afero.File, error) {
 
 // toOsFileFlags converts SFTP open flags to os.OpenFile flags. O_APPEND is
 // deliberately never set: the request server writes with WriteAt offsets,
-// which conflict with append-mode files.
+// which conflict with append-mode files. An Append open is treated as write
+// intent so it doesn't fall through to O_RDONLY (clients that resume uploads
+// then write at explicit offsets, which is correct without O_APPEND).
 func toOsFileFlags(p sftp.FileOpenFlags) int {
 	var flags int
 	switch {
-	case p.Read && p.Write:
+	case p.Read && (p.Write || p.Append):
 		flags = os.O_RDWR
-	case p.Write:
+	case p.Write || p.Append:
 		flags = os.O_WRONLY
 	default:
 		flags = os.O_RDONLY
@@ -142,6 +162,7 @@ func (h *sftpHandlers) Filecmd(r *sftp.Request) error {
 func (h *sftpHandlers) setstat(r *sftp.Request) error {
 	path := r.Filepath
 	if !h.server.authorizer.CanWrite(h.user, path) {
+		logging.Access.LogAccess("setstat", h.user, path, "denied", "error", os.ErrPermission)
 		return sftp.ErrSSHFxPermissionDenied
 	}
 
@@ -151,31 +172,36 @@ func (h *sftpHandlers) setstat(r *sftp.Request) error {
 	if flags.Size {
 		file, err := h.fs.OpenFile(path, os.O_WRONLY, 0)
 		if err != nil {
-			return err
+			logging.Access.LogAccess("setstat", h.user, path, "error", "error", err)
+			return translateError(err)
 		}
 		err = file.Truncate(int64(attrs.Size))
 		file.Close()
 		if err != nil {
-			return err
+			logging.Access.LogAccess("setstat", h.user, path, "error", "error", err)
+			return translateError(err)
 		}
 	}
 	if flags.Permissions {
 		if err := h.fs.Chmod(path, os.FileMode(attrs.Mode)&os.ModePerm); err != nil {
-			return err
+			logging.Access.LogAccess("setstat", h.user, path, "error", "error", err)
+			return translateError(err)
 		}
 	}
 	if flags.Acmodtime {
 		atime := time.Unix(int64(attrs.Atime), 0)
 		mtime := time.Unix(int64(attrs.Mtime), 0)
 		if err := h.fs.Chtimes(path, atime, mtime); err != nil {
-			return err
+			logging.Access.LogAccess("setstat", h.user, path, "error", "error", err)
+			return translateError(err)
 		}
 	}
-	if flags.UidGid {
-		if err := h.fs.Chown(path, int(attrs.UID), int(attrs.GID)); err != nil {
-			return err
-		}
-	}
+	// UID/GID changes are intentionally ignored: there is no legitimate use in
+	// this authorization model, and honoring chown would be dangerous if the
+	// daemon runs as root. Clients that request it (e.g. "preserve attributes")
+	// still succeed for the other attributes.
+
+	logging.Access.LogAccess("setstat", h.user, path, "success", "mode", "write")
 	return nil
 }
 
@@ -191,7 +217,7 @@ func (h *sftpHandlers) rename(r *sftp.Request) error {
 
 	if err := h.fs.Rename(oldPath, newPath); err != nil {
 		logging.Access.LogAccess("rename", h.user, oldPath, "error", "error", err)
-		return err
+		return translateError(err)
 	}
 
 	logging.Access.LogAccess("rename", h.user, oldPath, "success", "mode", "write")
@@ -207,7 +233,7 @@ func (h *sftpHandlers) remove(r *sftp.Request) error {
 
 	if err := h.fs.Remove(path); err != nil {
 		logging.Access.LogAccess("remove", h.user, path, "error", "error", err)
-		return err
+		return translateError(err)
 	}
 
 	logging.Access.LogAccess("remove", h.user, path, "success", "mode", "write")
@@ -223,7 +249,7 @@ func (h *sftpHandlers) mkdir(r *sftp.Request) error {
 
 	if err := h.fs.Mkdir(path, 0755); err != nil {
 		logging.Access.LogAccess("mkdir", h.user, path, "error", "error", err)
-		return err
+		return translateError(err)
 	}
 
 	logging.Access.LogAccess("mkdir", h.user, path, "success", "mode", "write")
@@ -245,14 +271,14 @@ func (h *sftpHandlers) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 		f, err := h.fs.Open(path)
 		if err != nil {
 			logging.Access.LogAccess("readdir", h.user, path, "error", "error", err)
-			return nil, err
+			return nil, translateError(err)
 		}
 		defer f.Close()
 
 		entries, err := f.Readdir(-1)
 		if err != nil {
 			logging.Access.LogAccess("readdir", h.user, path, "error", "error", err)
-			return nil, err
+			return nil, translateError(err)
 		}
 
 		sort.Slice(entries, func(i, j int) bool {
@@ -264,11 +290,12 @@ func (h *sftpHandlers) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 
 	case "Stat":
 		if !h.server.authorizer.CanRead(h.user, path) {
+			logging.Access.LogAccess("stat", h.user, path, "denied", "error", os.ErrPermission)
 			return nil, sftp.ErrSSHFxPermissionDenied
 		}
 		fi, err := h.fs.Stat(path)
 		if err != nil {
-			return nil, err
+			return nil, translateError(err)
 		}
 		return listerAt{fi}, nil
 

@@ -279,3 +279,91 @@ func TestStopClosesActiveConnections(t *testing.T) {
 	_, err := client.Getwd()
 	assert.Error(t, err, "client should be disconnected after Stop")
 }
+
+// TestStopWithHalfOpenConnection verifies Stop does not block on a client that
+// connected but never completed the SSH handshake (which would otherwise hold
+// handleConn until the 30s handshake deadline).
+func TestStopWithHalfOpenConnection(t *testing.T) {
+	server, addr := startTestServer(t)
+
+	raw, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	require.NoError(t, err)
+	defer raw.Close()
+
+	// Wait until the server has registered the connection.
+	require.Eventually(t, func() bool {
+		return server.GetActiveConnections() >= 1
+	}, 2*time.Second, 10*time.Millisecond)
+
+	done := make(chan error, 1)
+	go func() { done <- server.Stop() }()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop blocked on a half-open connection (should close it, not wait for handshake timeout)")
+	}
+}
+
+// TestErrorMessagesDoNotLeakRealPath ensures the jail's real filesystem path
+// never appears in errors sent to SFTP clients.
+func TestErrorMessagesDoNotLeakRealPath(t *testing.T) {
+	server, addr := startTestServer(t)
+	_, client := dialSFTP(t, addr)
+	root := server.config.RootDir
+
+	_, err := client.Stat("/players/alice/does-not-exist")
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), root)
+
+	_, err = client.Open("/players/alice/also-missing")
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), root)
+	assert.True(t, os.IsNotExist(err), "should map to no-such-file, got: %v", err)
+}
+
+// TestChownIsIgnored verifies a client chown request succeeds without changing
+// ownership (it is deliberately a no-op in this authz model).
+func TestChownIsIgnored(t *testing.T) {
+	_, addr := startTestServer(t)
+	_, client := dialSFTP(t, addr)
+
+	f, err := client.Create("/players/alice/owned.txt")
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	// Chown to root:root would fail with EPERM if actually attempted as non-root;
+	// because the server ignores uid/gid, the request succeeds.
+	err = client.Chown("/players/alice/owned.txt", 0, 0)
+	assert.NoError(t, err)
+}
+
+// TestAppendUpload verifies an append-mode open works end to end.
+func TestAppendUpload(t *testing.T) {
+	_, addr := startTestServer(t)
+	_, client := dialSFTP(t, addr)
+
+	f, err := client.Create("/players/alice/log.txt")
+	require.NoError(t, err)
+	_, err = f.Write([]byte("first\n"))
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	// Open for append (the write-intent regression: Append must open writable,
+	// not O_RDONLY) and resume at end-of-file as a real client does.
+	af, err := client.OpenFile("/players/alice/log.txt", os.O_WRONLY|os.O_APPEND)
+	require.NoError(t, err)
+	_, err = af.Seek(0, io.SeekEnd)
+	require.NoError(t, err)
+	_, err = af.Write([]byte("second\n"))
+	require.NoError(t, err)
+	require.NoError(t, af.Close())
+
+	rf, err := client.Open("/players/alice/log.txt")
+	require.NoError(t, err)
+	defer rf.Close()
+	data, err := io.ReadAll(rf)
+	require.NoError(t, err)
+	assert.Equal(t, "first\nsecond\n", string(data))
+}
