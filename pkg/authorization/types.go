@@ -17,6 +17,13 @@ const (
 	GrantGrant Permission = 5
 )
 
+// isValid reports whether p is one of the defined permission levels. Note that
+// 0 is not a valid level: LPC mappings cannot store a 0 value (assigning 0
+// deletes the key), so an access entry is always Revoked (-1) or Read..GrantGrant.
+func (p Permission) isValid() bool {
+	return p == Revoked || (p >= Read && p <= GrantGrant)
+}
+
 // CanRead returns true if the permission allows reading
 func (p Permission) CanRead() bool {
 	return p >= Read
