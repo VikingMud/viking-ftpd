@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/mmcdole/viking-ftpd/pkg/logging"
@@ -16,6 +17,11 @@ const (
 	// LevelField is the field name for the user's level
 	LevelField = "level"
 )
+
+// validUsername restricts usernames to characters that cannot escape the
+// character directory when joined into a filesystem path. This blocks path
+// traversal (e.g. "../../etc/passwd") before any file access.
+var validUsername = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 // FileSource implements Source using the filesystem
 type FileSource struct {
@@ -32,9 +38,6 @@ func NewFileSource(rootDir string) *FileSource {
 
 // getCharacterPath returns the full path to a user file
 func (s *FileSource) getCharacterPath(username string) string {
-	if username == "" {
-		return ""
-	}
 	// Get first letter of username for subdirectory
 	firstLetter := strings.ToLower(username[0:1])
 	path := filepath.Join(s.rootDir, firstLetter, username+".o")
@@ -43,11 +46,16 @@ func (s *FileSource) getCharacterPath(username string) string {
 
 // LoadUser implements Source
 func (s *FileSource) LoadUser(username string) (*User, error) {
-	path := s.getCharacterPath(username)
-	if path == "" {
-		logging.App.Debug("Invalid username provided", "username", username)
-		return nil, fmt.Errorf("invalid username")
+	// Reject usernames that could traverse outside the character directory.
+	// Return ErrUserNotFound (not a distinct error) so the authenticator still
+	// runs its constant-time dummy verification and cannot leak, via error or
+	// timing, whether a name was invalid versus simply unknown.
+	if !validUsername.MatchString(username) {
+		logging.App.Debug("Rejected invalid username", "username", username)
+		return nil, ErrUserNotFound
 	}
+
+	path := s.getCharacterPath(username)
 
 	// Check if file exists
 	data, err := os.ReadFile(path)
