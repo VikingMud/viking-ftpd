@@ -48,6 +48,7 @@ type Server struct {
 	config        *Config
 	authenticator Authenticator
 	authorizer    vfs.Authorizer
+	userSource    UserSource
 	sshConfig     *ssh.ServerConfig
 	version       string
 
@@ -62,8 +63,9 @@ type Server struct {
 
 // New creates a new SFTP server. The host key is loaded (or generated)
 // eagerly so that a bad key configuration fails at startup rather than on
-// first connection.
-func New(config *Config, authorizer vfs.Authorizer, authenticator Authenticator, version string) (*Server, error) {
+// first connection. userSource enables public-key authentication against
+// each player's uploaded authorized_keys file; pass nil for password-only.
+func New(config *Config, authorizer vfs.Authorizer, authenticator Authenticator, userSource UserSource, version string) (*Server, error) {
 	if _, err := os.Stat(config.RootDir); err != nil {
 		return nil, fmt.Errorf("root directory does not exist: %w", err)
 	}
@@ -80,13 +82,12 @@ func New(config *Config, authorizer vfs.Authorizer, authenticator Authenticator,
 		config:        config,
 		authenticator: authenticator,
 		authorizer:    authorizer,
+		userSource:    userSource,
 		version:       version,
 		conns:         make(map[net.Conn]struct{}),
 	}
 	s.SetStartTime(time.Now())
 
-	// Only password auth is offered; with no PublicKeyCallback the publickey
-	// method is never advertised to clients.
 	sshConfig := &ssh.ServerConfig{
 		MaxAuthTries:     6,
 		ServerVersion:    "SSH-2.0-VikingSFTP",
@@ -94,6 +95,12 @@ func New(config *Config, authorizer vfs.Authorizer, authenticator Authenticator,
 		AuthLogCallback: func(conn ssh.ConnMetadata, method string, err error) {
 			logging.App.Debug("SSH auth attempt", "user", conn.User(), "method", method, "success", err == nil)
 		},
+	}
+	// Public-key auth needs a character lookup and a home directory to find
+	// the player's authorized_keys in; without both, the publickey method is
+	// simply never advertised to clients.
+	if userSource != nil && config.HomePattern != "" {
+		sshConfig.PublicKeyCallback = s.publicKeyCallback
 	}
 	sshConfig.AddHostKey(signer)
 	s.sshConfig = sshConfig
@@ -255,6 +262,15 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 	tconn.activate()
 	defer sconn.Close()
+
+	// Public-key logins are logged here rather than in the auth callback:
+	// the callback fires before (and without) signature verification, so
+	// only a completed handshake proves the client holds the private key.
+	if sconn.Permissions != nil {
+		if fp := sconn.Permissions.Extensions[permPubKeyFingerprint]; fp != "" {
+			logging.Access.LogAuth("login", sconn.User(), "success", "method", "publickey", "fingerprint", fp, "client_ip", remoteAddr, "protocol", "sftp")
+		}
+	}
 
 	go ssh.DiscardRequests(reqs)
 	s.handleChannels(sconn, chans)

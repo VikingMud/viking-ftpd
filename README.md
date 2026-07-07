@@ -89,7 +89,7 @@ Notes:
 
 - SFTP shares `ftp_root_dir`, `home_pattern`, `max_connections`, and `idle_timeout` with the FTP server, and enforces the same per-path permissions from the MUD's access tree.
 - If the host key file does not exist, an ed25519 key is generated on first start (mode 0600) and its fingerprint logged. An existing but corrupt or group/world-accessible key file is a startup error — the key is never silently regenerated, so clients never see an unexpected host key change.
-- Authentication is by MUD password only; SSH public-key auth is not offered.
+- Authentication is by MUD password, or by SSH public key: upload your public key(s) to `.authorized_keys` in your home directory (e.g. `/players/<name>/.authorized_keys`, standard `authorized_keys` format, one key per line) and key logins work on the next connection. The character must still exist in the MUD — keys in a leftover directory of a deleted player grant nothing. Files over 64 KiB are refused; unparseable lines are skipped.
 - Only the `sftp` subsystem is served. Shell, exec, and port-forwarding requests are refused, so `ssh` gives no shell and `scp` (which uses exec) does not work — use `sftp`/SFTP-capable clients.
 - SFTP operations appear in the access log with the same `op=`/`status=` vocabulary as FTP (plus a `setstat` op for attribute changes); connect, disconnect, and login lines carry an extra `protocol=sftp` field. SFTP has no `chdir` operation (directory changes are client-side in the protocol).
 - Symlink and hardlink creation, and readlink, are refused. Client-requested ownership changes (chown) are accepted but ignored — there is no owner concept in the MUD's permission model.
