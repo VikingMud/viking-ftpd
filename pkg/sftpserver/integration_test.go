@@ -57,7 +57,7 @@ func startTestServer(t *testing.T) (*Server, string) {
 		HomePattern: "players/%s",
 		HostKeyFile: filepath.Join(t.TempDir(), "host_key"),
 		IdleTimeout: 30 * time.Second,
-	}, authorizer, authenticator, "test")
+	}, authorizer, authenticator, charSource, "test")
 	require.NoError(t, err)
 
 	go server.ListenAndServe()

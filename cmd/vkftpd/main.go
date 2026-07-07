@@ -140,7 +140,7 @@ Configuration file must be in JSON format with the following structure:
 				HostKeyFile:    config.SSHHostKeyFile,
 				IdleTimeout:    time.Duration(config.IdleTimeout) * time.Second,
 				MaxConnections: config.MaxConnections,
-			}, authorizer, authenticator, version)
+			}, authorizer, authenticator, charSource, version)
 			if err != nil {
 				return fmt.Errorf("failed to create SFTP server: %w", err)
 			}

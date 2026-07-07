@@ -23,6 +23,13 @@ const (
 // traversal (e.g. "../../etc/passwd") before any file access.
 var validUsername = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
+// IsValidUsername reports whether name is safe to join into a filesystem
+// path. Any component that consumes an unauthenticated username to build a
+// path (character files, per-user authorized_keys) must apply this check.
+func IsValidUsername(name string) bool {
+	return validUsername.MatchString(name)
+}
+
 // FileSource implements Source using the filesystem
 type FileSource struct {
 	// rootDir is the path to the directory containing user subdirectories
@@ -50,7 +57,7 @@ func (s *FileSource) LoadUser(username string) (*User, error) {
 	// Return ErrUserNotFound (not a distinct error) so the authenticator still
 	// runs its constant-time dummy verification and cannot leak, via error or
 	// timing, whether a name was invalid versus simply unknown.
-	if !validUsername.MatchString(username) {
+	if !IsValidUsername(username) {
 		logging.App.Debug("Rejected invalid username", "username", username)
 		return nil, ErrUserNotFound
 	}
