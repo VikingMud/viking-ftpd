@@ -1,8 +1,8 @@
 # VikingMUD FTP Daemon
 
-A custom FTP and SFTP server designed specifically for [VikingMUD](https://www.vikingmud.org), providing secure file access with native integration into the MUD's [player authentication](docs/player_authentication.md) and hiearchical [authorization system](docs/viking_access_tree.md). This daemon understands [LPC serialized object format](https://github.com/mmcdole/viking-ftpd/blob/main/docs/lpc_object_format.md) and directly interfaces with the MUD's character database and access control trees.
+A custom FTP and SFTP server for [VikingMUD](https://www.vikingmud.org) that integrates with the MUD's [player authentication](docs/player_authentication.md) and hierarchical [authorization system](docs/viking_access_tree.md). The daemon reads the [LPC serialized object format](https://github.com/mmcdole/viking-ftpd/blob/main/docs/lpc_object_format.md) and works directly from the MUD's character database and access control trees.
 
-Both protocols share the same authentication (MUD character passwords), the same per-path authorization (the MUD's access tree), the same filesystem jail, and the same access logs — SFTP is simply a more secure transport for the same access.
+Both protocols share the same authentication, the same per-path authorization from the MUD's access tree, the same filesystem jail, and the same access logs. SFTP is the same access over a more secure transport.
 
 
 ## Installation
@@ -87,13 +87,10 @@ SFTP (file transfer over SSH) is enabled by setting `sftp_port`:
 
 Notes:
 
-- SFTP shares `ftp_root_dir`, `home_pattern`, `max_connections`, and `idle_timeout` with the FTP server, and enforces the same per-path permissions from the MUD's access tree.
-- If the host key file does not exist, an ed25519 key is generated on first start (mode 0600) and its fingerprint logged. An existing but corrupt or group/world-accessible key file is a startup error — the key is never silently regenerated, so clients never see an unexpected host key change.
-- Authentication is by MUD password, or by SSH public key: upload your public key(s) to `.authorized_keys` in your home directory (e.g. `/players/<name>/.authorized_keys`, standard `authorized_keys` format, one key per line) and key logins work on the next connection. The character must still exist in the MUD — keys in a leftover directory of a deleted player grant nothing. Files over 64 KiB are refused; unparseable lines are skipped.
-- Only the `sftp` subsystem is served. Shell, exec, and port-forwarding requests are refused, so `ssh` gives no shell and `scp` (which uses exec) does not work — use `sftp`/SFTP-capable clients.
-- SFTP operations appear in the access log with the same `op=`/`status=` vocabulary as FTP (plus a `setstat` op for attribute changes); connect, disconnect, and login lines carry an extra `protocol=sftp` field. SFTP has no `chdir` operation (directory changes are client-side in the protocol).
-- Symlink and hardlink creation, and readlink, are refused. Client-requested ownership changes (chown) are accepted but ignored — there is no owner concept in the MUD's permission model.
-- `max_connections` is enforced for both FTP and SFTP connections (each protocol counts its own connections against the limit).
+- SFTP shares `ftp_root_dir`, `home_pattern`, `max_connections`, and `idle_timeout` with the FTP server and enforces the same per-path permissions from the MUD's access tree.
+- Log in with your MUD password, or with an SSH key: upload your public key(s) to `.authorized_keys` in your home directory (`/players/<name>/.authorized_keys`, same format as `~/.ssh/authorized_keys`). Keys only work while the character exists.
+- Only the `sftp` subsystem is served. There is no shell, and `scp` does not work. Use `sftp` or any SFTP-capable client.
+- If the host key file does not exist, an ed25519 key is generated on first start. A corrupt or group/world-accessible key file is a startup error, and the key is never silently regenerated.
 
 ### Caching and Logging
 - `character_cache_time`: How long to cache character data in seconds (default: 60)
