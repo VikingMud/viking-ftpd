@@ -16,10 +16,10 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.22'
+        go-version-file: go.mod
 
     - name: Test
-      run: go test -v ./...
+      run: go test -race ./...
 
   build:
     needs: test
@@ -32,7 +32,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.22'
+        go-version-file: go.mod
 
     - name: Build
       run: |
@@ -62,7 +62,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.22'
+        go-version-file: go.mod
 
     - name: Build release binaries
       env:
@@ -75,6 +75,7 @@ jobs:
         GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o vkftpd-linux-amd64 ./cmd/vkftpd
         GOOS=darwin GOARCH=amd64 go build -ldflags "$LDFLAGS" -o vkftpd-darwin-amd64 ./cmd/vkftpd
         GOOS=darwin GOARCH=arm64 go build -ldflags "$LDFLAGS" -o vkftpd-darwin-arm64 ./cmd/vkftpd
+        sha256sum vkftpd-linux-amd64 vkftpd-darwin-amd64 vkftpd-darwin-arm64 > SHA256SUMS
 
     - name: Create Release
       uses: softprops/action-gh-release@v1
@@ -83,4 +84,5 @@ jobs:
           vkftpd-linux-amd64
           vkftpd-darwin-amd64
           vkftpd-darwin-arm64
+          SHA256SUMS
         generate_release_notes: true

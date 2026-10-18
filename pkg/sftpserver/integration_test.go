@@ -95,6 +95,51 @@ func dialSFTP(t *testing.T, addr string) (*ssh.Client, *sftp.Client) {
 	return sshClient, sftpClient
 }
 
+// Exercise real handshakes and transfers so dependency upgrades cannot silently
+// drop post-quantum support or the traditional exchanges older clients need.
+func TestKeyExchangeCompatibility(t *testing.T) {
+	_, addr := startTestServer(t)
+	for _, tc := range []struct {
+		name string
+		kex  []string
+		want string
+	}{
+		{"default prefers post-quantum", nil, ssh.KeyExchangeMLKEM768X25519},
+		{"post-quantum only", []string{ssh.KeyExchangeMLKEM768X25519}, ssh.KeyExchangeMLKEM768X25519},
+		{"traditional curve25519", []string{ssh.KeyExchangeCurve25519}, ssh.KeyExchangeCurve25519},
+		{"traditional ecdh", []string{ssh.KeyExchangeECDHP256}, ssh.KeyExchangeECDHP256},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, err := ssh.Dial("tcp", addr, &ssh.ClientConfig{
+				Config:          ssh.Config{KeyExchanges: tc.kex},
+				User:            "alice",
+				Auth:            []ssh.AuthMethod{ssh.Password(testPassword)},
+				HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+				Timeout:         5 * time.Second,
+			})
+			require.NoError(t, err)
+			defer client.Close()
+			negotiated, ok := client.Conn.(ssh.AlgorithmsConnMetadata)
+			require.True(t, ok, "SSH connection must expose negotiated algorithms")
+			require.Equal(t, tc.want, negotiated.Algorithms().KeyExchange)
+			files, err := sftp.NewClient(client)
+			require.NoError(t, err)
+			defer files.Close()
+			f, err := files.Create("/players/alice/kex-test.txt")
+			require.NoError(t, err)
+			_, err = f.Write([]byte("key exchange transfer test"))
+			require.NoError(t, err)
+			require.NoError(t, f.Close())
+			f, err = files.Open("/players/alice/kex-test.txt")
+			require.NoError(t, err)
+			defer f.Close()
+			data, err := io.ReadAll(f)
+			require.NoError(t, err)
+			require.Equal(t, "key exchange transfer test", string(data))
+		})
+	}
+}
+
 func TestAuthentication(t *testing.T) {
 	_, addr := startTestServer(t)
 
